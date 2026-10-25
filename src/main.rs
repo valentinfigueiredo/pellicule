@@ -9,6 +9,7 @@ mod cli;
 mod config;
 mod date;
 mod gui;
+mod icloud;
 mod platform;
 mod thumbs;
 mod update;

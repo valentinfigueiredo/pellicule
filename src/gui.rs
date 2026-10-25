@@ -2,7 +2,7 @@
 //! groupées par mois. Les imports et la surveillance de « À trier » tournent en arrière-plan.
 
 use crate::album::{self, Album, InboxWatcher, Mode, Outcome};
-use crate::{config, platform, thumbs, update};
+use crate::{config, icloud, platform, thumbs, update};
 use eframe::egui::{
     self, Align, Align2, Color32, Context, CornerRadius, FontId, Id, LayerId, Layout, Order, Rect,
     Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2,
@@ -243,6 +243,11 @@ struct App {
     updates: Option<Receiver<update::State>>,
     /// Commit de la mise à jour en cours, pour pouvoir réessayer.
     retry_rev: String,
+    icloud: Option<icloud::Worker>,
+    icloud_open: bool,
+    icloud_id: String,
+    icloud_pwd: String,
+    icloud_code: String,
 }
 
 impl App {
@@ -268,6 +273,11 @@ impl App {
             update: update::State::Unknown,
             updates: Some(update::check_in_background(ctx.clone())),
             retry_rev: String::new(),
+            icloud: None,
+            icloud_open: std::env::var_os("PELLICULE_ICLOUD").is_some(), // pour les captures de développement
+            icloud_id: String::new(),
+            icloud_pwd: String::new(),
+            icloud_code: String::new(),
         };
         if let Some(root) = root {
             app.start(ctx, root);
@@ -283,6 +293,7 @@ impl App {
         if !self.pending.is_empty() {
             let _ = cmd_tx.send(Cmd::Import(std::mem::take(&mut self.pending)));
         }
+        self.icloud = Some(icloud::Worker::start(&root, ctx.clone()));
         self.root = Some(root);
         self.cmds = Some(cmd_tx);
         self.events = Some(ev_rx);
@@ -428,6 +439,18 @@ impl App {
                     if ui.button("+  Ajouter des photos…").clicked() {
                         self.add_folder_dialog();
                     }
+                    if let Some(worker) = &self.icloud {
+                        let label = match worker.state() {
+                            icloud::State::Syncing { seen, total, .. } => format!("iCloud {} / {}", spaced(seen as usize), spaced(total as usize)),
+                            icloud::State::Ready { .. } => "iCloud connecté".into(),
+                            icloud::State::NeedCode { .. } => "iCloud : code".into(),
+                            icloud::State::Busy(_) => "iCloud…".into(),
+                            icloud::State::LoggedOut { .. } => "Connecter iCloud".into(),
+                        };
+                        if ui.button(label).clicked() {
+                            self.icloud_open = !self.icloud_open;
+                        }
+                    }
                     self.update_button(ui);
                     ui.add_space(12.0);
                     ui.add(egui::Slider::new(&mut self.size, 90.0..=320.0).show_value(false));
@@ -440,6 +463,119 @@ impl App {
             }
             ui.add_space(6.0);
         });
+    }
+
+    fn icloud_window(&mut self, ctx: &Context) {
+        let Self { icloud, icloud_open, icloud_id, icloud_pwd, icloud_code, .. } = self;
+        let Some(worker) = icloud.as_ref() else { return };
+        let state = worker.state();
+        if matches!(state, icloud::State::NeedCode { .. }) {
+            *icloud_open = true;
+        }
+        if !*icloud_open {
+            return;
+        }
+        let error_color = ctx.global_style().visuals.error_fg_color;
+        egui::Window::new("iCloud Photos")
+            .open(icloud_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                match state {
+                    icloud::State::LoggedOut { apple_id, error } => {
+                        if icloud_id.is_empty() && !apple_id.is_empty() {
+                            *icloud_id = apple_id;
+                        }
+                        ui.label("Récupère toutes tes photos et vidéos iCloud dans ta pellicule, puis les nouvelles automatiquement.");
+                        ui.add_space(6.0);
+                        ui.weak("Avant : sur ton iPhone, Réglages > ton nom > iCloud : active « Accéder aux données iCloud sur le web » et désactive « Protection avancée des données ».");
+                        ui.add_space(10.0);
+                        egui::Grid::new("icloud_login").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                            ui.label("Identifiant Apple");
+                            ui.add(egui::TextEdit::singleline(icloud_id).hint_text("prenom@icloud.com").desired_width(260.0));
+                            ui.end_row();
+                            ui.label("Mot de passe");
+                            ui.add(egui::TextEdit::singleline(icloud_pwd).password(true).desired_width(260.0));
+                            ui.end_row();
+                        });
+                        if let Some(e) = error {
+                            ui.add_space(4.0);
+                            ui.colored_label(error_color, e);
+                        }
+                        ui.add_space(8.0);
+                        let ready = !icloud_id.trim().is_empty() && !icloud_pwd.is_empty();
+                        let enter = ready && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.add_enabled(ready, egui::Button::new("Se connecter")).clicked() || enter {
+                            worker.send(icloud::Cmd::Login { apple_id: icloud_id.trim().to_string(), password: std::mem::take(icloud_pwd) });
+                        }
+                        ui.add_space(6.0);
+                        ui.weak("Ton mot de passe n'est jamais enregistré. Connexion non officielle : la même méthode que le site icloud.com.");
+                    }
+                    icloud::State::NeedCode { error } => {
+                        ui.label("Apple a envoyé un code à 6 chiffres sur ton iPhone (ou un autre appareil Apple). Entre-le ici :");
+                        ui.add_space(8.0);
+                        let resp = ui.add(egui::TextEdit::singleline(icloud_code).hint_text("123456").desired_width(120.0).font(FontId::proportional(22.0)));
+                        if icloud_code.is_empty() {
+                            resp.request_focus();
+                        }
+                        icloud_code.retain(|c| c.is_ascii_digit());
+                        icloud_code.truncate(6);
+                        if let Some(e) = error {
+                            ui.colored_label(error_color, e);
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let ready = icloud_code.len() == 6;
+                            let enter = ready && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.add_enabled(ready, egui::Button::new("Valider")).clicked() || enter {
+                                worker.send(icloud::Cmd::Code(std::mem::take(icloud_code)));
+                            }
+                            if ui.button("Annuler").clicked() {
+                                worker.send(icloud::Cmd::Logout);
+                            }
+                        });
+                    }
+                    icloud::State::Busy(msg) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(msg);
+                        });
+                    }
+                    icloud::State::Ready { apple_id, last } => {
+                        ui.label(format!("Connecté à iCloud : {apple_id}"));
+                        if let Some(msg) = last {
+                            ui.add_space(4.0);
+                            ui.label(msg);
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Récupérer les nouveautés").clicked() {
+                                worker.send(icloud::Cmd::Sync);
+                            }
+                            if ui.button("Se déconnecter").clicked() {
+                                worker.send(icloud::Cmd::Logout);
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.weak("Tant que Pellicule est ouverte, elle regarde aussi toute seule toutes les 30 minutes.");
+                    }
+                    icloud::State::Syncing { seen, total, downloaded } => {
+                        ui.label("Lecture de ta photothèque iCloud…");
+                        ui.add_space(6.0);
+                        let frac = if total > 0 { seen as f32 / total as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(frac).text(format!("{} / {}", spaced(seen as usize), spaced(total as usize))));
+                        ui.label(format!("{} nouvelle{} récupérée{}", spaced(downloaded as usize), plural(downloaded as usize), plural(downloaded as usize)));
+                        ui.weak("Elles arrivent dans ta pellicule au fur et à mesure. Tu peux fermer cette fenêtre.");
+                        ui.add_space(6.0);
+                        if ui.button("Arrêter").clicked() {
+                            worker.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
     }
 
     fn update_button(&mut self, ui: &mut egui::Ui) {
@@ -677,6 +813,8 @@ impl eframe::App for App {
                 self.gallery(ui);
             }
         });
+
+        self.icloud_window(&ctx);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let screen = ctx.content_rect();

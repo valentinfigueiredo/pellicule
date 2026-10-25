@@ -36,6 +36,23 @@ gratuites « HEIF Image Extensions » et « HEVC Video Extensions » du Microsof
 Si un aperçu manque, la raison est notée dans `.pellicule\apercus.log`, et
 `pellicule apercu <fichier>` (dans un terminal) explique ce qui coince.
 
+## iCloud Photos
+
+Bouton « Connecter iCloud » en haut de la fenêtre : identifiant Apple, mot de passe, puis le code à
+6 chiffres reçu sur l'iPhone. Pellicule récupère alors **toute la photothèque iCloud** (originaux),
+puis les nouveautés toutes les 30 minutes tant qu'elle est ouverte. Les fichiers arrivent dans
+`À trier` et sont rangés comme le reste (doublons écartés).
+
+- Connexion **non officielle** (la même que le site icloud.com, reprise d'icloudpd) : Apple peut la
+  casser un jour ; la mise à jour de Pellicule la réparera.
+- Sur l'iPhone : Réglages > ton nom > iCloud : **activer** « Accéder aux données iCloud sur le web »
+  et **désactiver** « Protection avancée des données ».
+- Le mot de passe n'est jamais enregistré. La session est gardée dans `.pellicule\icloud\session.bin`,
+  chiffrée par Windows pour ton compte. Les photos déjà récupérées sont notées dans
+  `deja-recuperees.txt` ; `journal.log` liste les échanges avec Apple (sans aucun secret) en cas de panne.
+- Récupérées : les originaux (photos, vidéos). Pas les retouches, ni les vidéos des Live Photos,
+  ni la photothèque partagée.
+
 Mise à jour : quand une nouvelle version est publiée sur GitHub, un bouton « Mettre à jour » apparaît
 en haut de la fenêtre. Un clic télécharge la nouvelle version et relance Pellicule
 (ça ne marche que si le dépôt GitHub est public).

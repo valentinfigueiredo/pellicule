@@ -35,3 +35,37 @@ pub fn attach_console() {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
+
+/// Chiffre des données pour le compte Windows actuel (DPAPI) : la session iCloud
+/// enregistrée sur le disque est illisible pour un autre utilisateur ou un autre PC.
+pub fn protect(data: &[u8]) -> Vec<u8> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+        let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        if CryptProtectData(&input, None, None, None, None, 0, &mut out).is_ok() {
+            let v = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+            let _ = LocalFree(Some(HLOCAL(out.pbData as _)));
+            return v;
+        }
+    }
+    data.to_vec()
+}
+
+pub fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+        let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        CryptUnprotectData(&input, None, None, None, None, 0, &mut out).ok()?;
+        let v = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        let _ = LocalFree(Some(HLOCAL(out.pbData as _)));
+        return Some(v);
+    }
+    #[cfg(not(windows))]
+    Some(data.to_vec())
+}
