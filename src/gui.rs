@@ -2,7 +2,7 @@
 //! groupées par mois. Les imports et la surveillance de « À trier » tournent en arrière-plan.
 
 use crate::album::{self, Album, InboxWatcher, Mode, Outcome};
-use crate::{config, platform, thumbs};
+use crate::{config, platform, thumbs, update};
 use eframe::egui::{
     self, Align, Align2, Color32, Context, CornerRadius, FontId, Id, LayerId, Layout, Order, Rect,
     Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2,
@@ -238,6 +238,9 @@ struct App {
     status: String,
     capture: Option<PathBuf>,
     quiet_frames: u32,
+    thumb_failures: usize,
+    update: update::State,
+    updates: Option<Receiver<update::State>>,
 }
 
 impl App {
@@ -259,6 +262,9 @@ impl App {
             status: String::new(),
             capture: std::env::var_os("PELLICULE_CAPTURE").map(PathBuf::from),
             quiet_frames: 0,
+            thumb_failures: 0,
+            update: update::State::Unknown,
+            updates: Some(update::check_in_background(ctx.clone())),
         };
         if let Some(root) = root {
             app.start(ctx, root);
@@ -319,13 +325,44 @@ impl App {
     }
 
     fn receive_thumbs(&mut self, ctx: &Context) {
+        let mut failures = Vec::new();
         for (rel, image) in self.loader.ready() {
             let thumb = match image {
-                Some(img) => Thumb::Ready(ctx.load_texture(&rel, img, TextureOptions::LINEAR)),
-                None => Thumb::Missing,
+                Ok(img) => Thumb::Ready(ctx.load_texture(&rel, img, TextureOptions::LINEAR)),
+                Err(e) => {
+                    failures.push(format!("{rel}\t{e}"));
+                    Thumb::Missing
+                }
             };
             self.thumbs.insert(rel, thumb);
             self.quiet_frames = 0;
+        }
+        self.log_failures(failures);
+    }
+
+    /// Garde une trace des aperçus impossibles dans `.pellicule/apercus.log` (pour comprendre pourquoi).
+    fn log_failures(&mut self, failures: Vec<String>) {
+        if failures.is_empty() {
+            return;
+        }
+        self.thumb_failures += failures.len();
+        if let Some(root) = &self.root {
+            let log = root.join(".pellicule").join("apercus.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+                use std::io::Write;
+                for line in &failures {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        }
+        if self.progress.is_none() {
+            self.status = format!(
+                "{} aperçu{} impossible{} (détails dans .pellicule{}apercus.log)",
+                self.thumb_failures,
+                plural(self.thumb_failures),
+                plural(self.thumb_failures),
+                std::path::MAIN_SEPARATOR
+            );
         }
     }
 
@@ -388,6 +425,7 @@ impl App {
                     if ui.button("+  Ajouter des photos…").clicked() {
                         self.add_folder_dialog();
                     }
+                    self.update_button(ui);
                     ui.add_space(12.0);
                     ui.add(egui::Slider::new(&mut self.size, 90.0..=320.0).show_value(false));
                     ui.weak("Taille");
@@ -401,11 +439,45 @@ impl App {
         });
     }
 
+    fn update_button(&mut self, ui: &mut egui::Ui) {
+        match self.update.clone() {
+            update::State::Available(version) => {
+                let label = egui::RichText::new(format!("Mettre à jour (v{version})")).color(Color32::WHITE);
+                let button = egui::Button::new(label).fill(ui.visuals().selection.bg_fill);
+                // Pas pendant un import : on ne coupe pas l'appli au milieu d'une copie.
+                let resp = ui.add_enabled(self.progress.is_none(), button).on_hover_text("Télécharge la dernière version sur GitHub et relance Pellicule");
+                if resp.clicked() {
+                    if cfg!(windows) {
+                        self.updates = Some(update::install_in_background(ui.ctx().clone()));
+                        self.update = update::State::Installing;
+                    } else {
+                        platform::open(Path::new(update::REPO));
+                    }
+                }
+            }
+            update::State::Installing => {
+                ui.label("Mise à jour…");
+                ui.spinner();
+            }
+            update::State::Failed(e) => {
+                if ui.button("Réessayer la mise à jour").on_hover_text(&e).clicked() {
+                    self.updates = Some(update::install_in_background(ui.ctx().clone()));
+                    self.update = update::State::Installing;
+                }
+                ui.colored_label(ui.visuals().error_fg_color, "Mise à jour échouée").on_hover_text(e);
+            }
+            update::State::Unknown | update::State::UpToDate => {}
+        }
+        ui.add_space(8.0);
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("etat").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.weak(format!("v{}", update::CURRENT));
+                    ui.add_space(12.0);
                     if ui.link(format!("Ouvrir « {} »", album::INBOX)).clicked() {
                         if let Some(root) = &self.root {
                             let inbox = root.join(album::INBOX);
@@ -489,8 +561,7 @@ impl App {
                     .map(|&i| &items[i])
                     .filter(|it| !thumbs.contains_key(&it.rel))
                     .map(|it| (it.rel.clone(), it.path.clone()))
-                    .collect::<Vec<_>>()
-                    .into_iter(),
+                    .collect(),
             );
             if thumbs.len() > MAX_TEXTURES {
                 let keep: HashSet<&str> = near.iter().map(|&i| items[i].rel.as_str()).collect();
@@ -574,6 +645,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.handle_events();
         self.receive_thumbs(&ctx);
+        if let Some(state) = self.updates.as_ref().and_then(|rx| rx.try_iter().last()) {
+            self.update = state;
+        }
 
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {

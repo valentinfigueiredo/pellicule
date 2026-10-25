@@ -1,7 +1,7 @@
 # Pellicule
 
 Un seul album pour toutes tes photos et vidéos, classé et renommé par date, sans doublons.
-Un seul fichier `pellicule.exe` (~5 Mo, écrit en Rust), rien à installer.
+Un seul fichier `pellicule.exe` (~6 Mo, écrit en Rust), rien à installer.
 
 Au lancement, tu as **ta pellicule** : toutes tes miniatures, de la plus récente à la plus ancienne,
 groupées par mois (comme sur un téléphone). Clic sur une photo ou une vidéo pour l'ouvrir,
@@ -30,9 +30,15 @@ Pellicule\
 4. **Au quotidien** : tant que la fenêtre est ouverte, tout ce que tu déposes dans `À trier`
    est renommé, rangé et apparaît dans la pellicule.
 
-Miniatures : Pellicule utilise celles de Windows (rapides, déjà en cache). Pour les photos iPhone
-(HEIC) et les vidéos HEVC, il faut les extensions gratuites « HEIF Image Extensions » / « HEVC »
-du Microsoft Store (souvent déjà installées sur Windows 11).
+Miniatures : JPEG, PNG, WebP, GIF, BMP et TIFF sont décodés par Pellicule. Pour les photos iPhone
+(HEIC), les RAW et les vidéos, Pellicule demande la miniature à Windows : il faut les extensions
+gratuites « HEIF Image Extensions » et « HEVC Video Extensions » du Microsoft Store.
+Si un aperçu manque, la raison est notée dans `.pellicule\apercus.log`, et
+`pellicule apercu <fichier>` (dans un terminal) explique ce qui coince.
+
+Mise à jour : quand une nouvelle version est publiée sur GitHub, un bouton « Mettre à jour » apparaît
+en haut de la fenêtre. Un clic télécharge la nouvelle version et relance Pellicule
+(ça ne marche que si le dépôt GitHub est public).
 
 En ligne de commande (depuis un terminal) :
 
@@ -43,6 +49,7 @@ pellicule importer --deplacer D:\DCIM     déplace au lieu de copier
 pellicule trier                           range « À trier » une fois
 pellicule surveiller                      range « À trier » en continu
 pellicule album D:\MonAlbum               change l'emplacement de l'album
+pellicule apercu D:\photo.heic            explique pourquoi un aperçu ne s'affiche pas
 ```
 
 ## Comment la date est trouvée
@@ -72,4 +79,6 @@ PELLICULE_CAPTURE=ecran.png cargo run --release -- --album <album>   # capture d
 ```
 
 Code : `album.rs` (index, doublons, rangement), `date.rs` (EXIF, QuickTime, noms), `gui.rs` (fenêtre),
-`thumbs.rs` (miniatures), `cli.rs` (commandes).
+`thumbs.rs` (miniatures), `update.rs` (mise à jour), `cli.rs` (commandes).
+
+Publier une version : augmenter `version` dans `Cargo.toml`, recompiler `dist/pellicule.exe`, pousser sur `master`.

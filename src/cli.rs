@@ -23,6 +23,7 @@ UTILISATION
   pellicule surveiller                      surveille « À trier » en continu
   pellicule trier                           traite « À trier » une seule fois
   pellicule album [chemin]                  affiche ou change l'emplacement de l'album
+  pellicule apercu <fichier>                explique pourquoi un aperçu ne s'affiche pas
 
 OPTIONS
   --deplacer        déplace au lieu de copier (les originaux disparaissent)
@@ -35,7 +36,7 @@ RANGEMENT
 ";
 
 pub fn is_command(a: &str) -> bool {
-    matches!(a, "importer" | "surveiller" | "trier" | "album" | "aide" | "-h" | "--help" | "/?" | "--version")
+    matches!(a, "importer" | "surveiller" | "trier" | "album" | "apercu" | "aperçu" | "aide" | "-h" | "--help" | "/?" | "--version")
 }
 
 pub struct Opts {
@@ -84,6 +85,18 @@ pub fn run(command: &str, opts: Opts, paths: Vec<PathBuf>) -> io::Result<()> {
             }
         },
         "importer" => import(&opts, &paths),
+        "apercu" | "aperçu" => {
+            for p in &paths {
+                println!("{}", p.display());
+                for (method, result) in crate::thumbs::diagnose(p) {
+                    match result {
+                        Ok([w, h]) => println!("  {method} : OK ({w}×{h})"),
+                        Err(e) => println!("  {method} : échec — {e}"),
+                    }
+                }
+            }
+            Ok(())
+        }
         "trier" => {
             let mut album = open_album(&opts)?;
             let files = album::collect(&album.inbox());

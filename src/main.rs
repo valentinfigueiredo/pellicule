@@ -11,11 +11,13 @@ mod date;
 mod gui;
 mod platform;
 mod thumbs;
+mod update;
 
 use std::env;
 use std::ffi::OsString;
 
 fn main() {
+    update::cleanup();
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let command = args.first().and_then(|a| a.to_str()).filter(|a| cli::is_command(a)).map(str::to_string);
     let rest = args.into_iter().skip(command.is_some() as usize);
