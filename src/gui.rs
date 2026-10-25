@@ -241,6 +241,8 @@ struct App {
     thumb_failures: usize,
     update: update::State,
     updates: Option<Receiver<update::State>>,
+    /// Commit de la mise à jour en cours, pour pouvoir réessayer.
+    retry_rev: String,
 }
 
 impl App {
@@ -265,6 +267,7 @@ impl App {
             thumb_failures: 0,
             update: update::State::Unknown,
             updates: Some(update::check_in_background(ctx.clone())),
+            retry_rev: String::new(),
         };
         if let Some(root) = root {
             app.start(ctx, root);
@@ -441,14 +444,15 @@ impl App {
 
     fn update_button(&mut self, ui: &mut egui::Ui) {
         match self.update.clone() {
-            update::State::Available(version) => {
+            update::State::Available { version, rev } => {
                 let label = egui::RichText::new(format!("Mettre à jour (v{version})")).color(Color32::WHITE);
                 let button = egui::Button::new(label).fill(ui.visuals().selection.bg_fill);
                 // Pas pendant un import : on ne coupe pas l'appli au milieu d'une copie.
                 let resp = ui.add_enabled(self.progress.is_none(), button).on_hover_text("Télécharge la dernière version sur GitHub et relance Pellicule");
                 if resp.clicked() {
                     if cfg!(windows) {
-                        self.updates = Some(update::install_in_background(ui.ctx().clone()));
+                        self.updates = Some(update::install_in_background(ui.ctx().clone(), rev.clone()));
+                        self.retry_rev = rev;
                         self.update = update::State::Installing;
                     } else {
                         platform::open(Path::new(update::REPO));
@@ -461,7 +465,7 @@ impl App {
             }
             update::State::Failed(e) => {
                 if ui.button("Réessayer la mise à jour").on_hover_text(&e).clicked() {
-                    self.updates = Some(update::install_in_background(ui.ctx().clone()));
+                    self.updates = Some(update::install_in_background(ui.ctx().clone(), self.retry_rev.clone()));
                     self.update = update::State::Installing;
                 }
                 ui.colored_label(ui.visuals().error_fg_color, "Mise à jour échouée").on_hover_text(e);

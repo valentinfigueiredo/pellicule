@@ -1,5 +1,7 @@
-//! Mise à jour depuis GitHub : on compare la version du `Cargo.toml` de la branche `master`
-//! avec la nôtre, puis on télécharge `dist/pellicule.exe` avec le `curl` fourni par Windows.
+//! Mise à jour depuis GitHub : on compare la version du `Cargo.toml` du dernier commit de `master`
+//! avec la nôtre, puis on télécharge le `dist/pellicule.exe` de ce même commit avec le `curl`
+//! fourni par Windows. Viser un commit précis évite le cache de GitHub (≈ 5 min), qui pourrait
+//! sinon annoncer la nouvelle version tout en servant l'ancien exe.
 
 use eframe::egui::Context;
 use std::env;
@@ -8,18 +10,18 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 pub const REPO: &str = "https://github.com/valentinfigueiredo/pellicule";
-const RAW: &str = "https://raw.githubusercontent.com/valentinfigueiredo/pellicule/master";
+const RAW: &str = "https://raw.githubusercontent.com/valentinfigueiredo/pellicule";
+const API: &str = "https://api.github.com/repos/valentinfigueiredo/pellicule/commits/master";
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum State {
     /// Pas encore vérifié, ou pas de connexion.
     Unknown,
     UpToDate,
-    Available(String),
+    Available { version: String, rev: String },
     Installing,
     Failed(String),
 }
@@ -28,7 +30,7 @@ pub fn check_in_background(ctx: Context) -> Receiver<State> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let state = match latest() {
-            Ok(v) if newer(&v, CURRENT) => State::Available(v),
+            Ok((version, rev)) if newer(&version, CURRENT) => State::Available { version, rev },
             Ok(_) => State::UpToDate,
             Err(_) => State::Unknown, // hors ligne : on ne dérange pas
         };
@@ -39,10 +41,10 @@ pub fn check_in_background(ctx: Context) -> Receiver<State> {
 }
 
 /// Télécharge la nouvelle version, remplace l'exe et relance Pellicule.
-pub fn install_in_background(ctx: Context) -> Receiver<State> {
+pub fn install_in_background(ctx: Context, rev: String) -> Receiver<State> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let err = install().err().unwrap_or_default();
+        let err = install(&rev).err().unwrap_or_default();
         let _ = tx.send(State::Failed(err));
         ctx.request_repaint();
     });
@@ -56,15 +58,24 @@ pub fn cleanup() {
     }
 }
 
-fn latest() -> Result<String, String> {
-    let out = curl().arg(format!("{RAW}/Cargo.toml?t={}", now())).output().map_err(|e| e.to_string())?;
+/// La version publiée et le commit où la trouver.
+fn latest() -> Result<(String, String), String> {
+    let rev = last_commit().unwrap_or_else(|| "master".into());
+    let out = curl().arg(format!("{RAW}/{rev}/Cargo.toml")).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err("GitHub injoignable".into());
     }
-    parse_version(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| "version introuvable".into())
+    let version = parse_version(&String::from_utf8_lossy(&out.stdout)).ok_or("version introuvable")?;
+    Ok((version, rev))
 }
 
-fn install() -> Result<(), String> {
+fn last_commit() -> Option<String> {
+    let out = curl().args(["-H", "Accept: application/vnd.github.sha", API]).output().ok()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit())).then_some(sha)
+}
+
+fn install(rev: &str) -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let new = exe.with_file_name("pellicule.new.exe");
     let old = exe.with_file_name("pellicule.old.exe");
@@ -72,7 +83,7 @@ fn install() -> Result<(), String> {
     let ok = curl()
         .arg("-o")
         .arg(&new)
-        .arg(format!("{RAW}/dist/pellicule.exe?t={}", now()))
+        .arg(format!("{RAW}/{rev}/dist/pellicule.exe"))
         .status()
         .map_err(|e| format!("curl introuvable : {e}"))?
         .success();
@@ -102,17 +113,13 @@ fn curl() -> Command {
     // Le curl de Windows (présent depuis Windows 10), sans passer par le PATH.
     let system = env::var_os("SystemRoot").map(|r| PathBuf::from(r).join("System32").join("curl.exe"));
     let mut cmd = Command::new(system.filter(|p| p.exists()).unwrap_or_else(|| "curl".into()));
-    cmd.args(["-fsSL", "--max-time", "300"]);
+    cmd.args(["-fsSL", "--max-time", "300", "-A", "pellicule"]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW : pas de console qui clignote
     }
     cmd
-}
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// La première ligne `version = "…"` du Cargo.toml (celle du paquet).
@@ -140,5 +147,14 @@ mod tests {
         assert!(!newer("0.1.9", "0.2.0"));
         let toml = "[package]\nname = \"pellicule\"\nversion = \"0.4.1\"\n\n[dependencies]\nchrono = { version = \"0.4\" }\n";
         assert_eq!(parse_version(toml).as_deref(), Some("0.4.1"));
+    }
+
+    /// Interroge le vrai dépôt : `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn github() {
+        let (version, rev) = latest().unwrap();
+        println!("version {version} au commit {rev}");
+        assert_eq!(rev.len(), 40);
     }
 }
