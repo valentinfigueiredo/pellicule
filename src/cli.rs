@@ -24,6 +24,7 @@ UTILISATION
   pellicule trier                           traite « À trier » une seule fois
   pellicule album [chemin]                  affiche ou change l'emplacement de l'album
   pellicule apercu <fichier>                explique pourquoi un aperçu ne s'affiche pas
+  pellicule ranger                          relit les dates et range ce qui n'est pas à sa place
 
 OPTIONS
   --deplacer        déplace au lieu de copier (les originaux disparaissent)
@@ -36,7 +37,7 @@ RANGEMENT
 ";
 
 pub fn is_command(a: &str) -> bool {
-    matches!(a, "importer" | "surveiller" | "trier" | "album" | "apercu" | "aperçu" | "aide" | "-h" | "--help" | "/?" | "--version")
+    matches!(a, "importer" | "surveiller" | "trier" | "ranger" | "album" | "apercu" | "aperçu" | "aide" | "-h" | "--help" | "/?" | "--version")
 }
 
 pub struct Opts {
@@ -103,6 +104,22 @@ pub fn run(command: &str, opts: Opts, paths: Vec<PathBuf>) -> io::Result<()> {
             sort_inbox(&mut album, &files)
         }
         "surveiller" => watch(&opts),
+        "ranger" => {
+            let mut album = open_album(&opts)?;
+            println!("Vérification des dates de {} fichiers…", album.len());
+            let moved = album.reorganize(&mut |_, _| {})?;
+            for (from, to) in &moved {
+                println!("  {}  ->  {}", display(from), display(to));
+            }
+            match (moved.len(), album.dry) {
+                (0, _) => println!("Tout est déjà bien rangé."),
+                (1, true) => println!("\n1 fichier à ranger."),
+                (1, false) => println!("\n1 fichier rangé."),
+                (n, true) => println!("\n{n} fichiers à ranger."),
+                (n, false) => println!("\n{n} fichiers rangés."),
+            }
+            Ok(())
+        }
         _ => unreachable!(),
     }
 }

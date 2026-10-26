@@ -202,6 +202,70 @@ impl Album {
         Ok(Outcome::Added { rel, source })
     }
 
+    /// Où ce fichier devrait être rangé : (dossier, début du nom, extension).
+    pub fn expected_place(&self, path: &Path) -> Option<(String, String, String, Source)> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        let kind = date::kind_of(&ext)?;
+        let meta = fs::metadata(path).ok()?;
+        let (when, source) = date::detect(path, kind, &ext, meta.modified().ok());
+        let dir = format!("{:04}/{:04}-{:02}", when.year(), when.year(), when.month());
+        Some((dir, date::file_stem_for(&when), date::normalize_ext(&ext).to_string(), source))
+    }
+
+    /// Relit la date de chaque fichier de l'album et range ce qui n'est pas à sa place
+    /// (fichiers ajoutés à la main, dates corrigées par une nouvelle version…).
+    /// Renvoie les déplacements (ancien → nouveau chemin relatif).
+    pub fn reorganize(&mut self, progress: &mut dyn FnMut(usize, usize)) -> io::Result<Vec<(String, String)>> {
+        let total = self.entries.len();
+        let mut moved = Vec::new();
+        for i in 0..total {
+            progress(i, total);
+            let rel = self.entries[i].rel.clone();
+            let path = self.path_of(&rel);
+            let Some((dir, stem, ext, _)) = self.expected_place(&path) else { continue };
+            let (cur_dir, cur_name) = rel.rsplit_once('/').unwrap_or(("", rel.as_str()));
+            let cur_name = cur_name.to_lowercase();
+            let rest = cur_name.strip_prefix(&stem).unwrap_or("?");
+            // Bien rangé : « <date>.ext » ou « <date>_NN.ext » dans le bon dossier.
+            let suffix_ok = rest == format!(".{ext}")
+                || rest.strip_prefix('_').and_then(|r| r.strip_suffix(&format!(".{ext}"))).is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
+            if cur_dir == dir && suffix_ok {
+                continue;
+            }
+            let new_rel = self.free_name(&dir, &stem, &ext);
+            if self.dry {
+                moved.push((rel, new_rel));
+                continue;
+            }
+            let dst = self.path_of(&new_rel);
+            fs::create_dir_all(dst.parent().unwrap())?;
+            if let Err(e) = transfer(&path, &dst, Mode::Move) {
+                self.log(&format!("non rangé ({e})"), &path, &rel);
+                continue;
+            }
+            self.log("rerangé", &path, &new_rel);
+            self.names.remove(&rel.to_lowercase());
+            self.names.insert(new_rel.to_lowercase());
+            self.entries[i].rel = new_rel.clone();
+            moved.push((rel, new_rel));
+        }
+        progress(total, total);
+        if !self.dry {
+            self.save()?;
+            // Les dossiers de mois vidés par le rangement.
+            if let Ok(rd) = fs::read_dir(&self.root) {
+                for e in rd.filter_map(Result::ok) {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if e.file_type().is_ok_and(|t| t.is_dir()) && !skip_dir(&name) && name != INBOX && name != DUPLICATES {
+                        prune_empty_dirs(&e.path());
+                        let _ = fs::remove_dir(e.path());
+                    }
+                }
+            }
+        }
+        Ok(moved)
+    }
+
     /// Range un doublon de la boîte « À trier » dans `_Doublons` (jamais supprimé).
     fn set_aside(&mut self, src: &Path) -> io::Result<()> {
         let dir = self.root.join(DUPLICATES);
@@ -225,6 +289,29 @@ impl Album {
         }
     }
 }
+
+/// Ce qu'on sait d'un fichier de l'album : son nom d'origine (d'après le journal).
+pub fn original_name(root: &Path, rel: &str) -> Option<String> {
+    let f = File::open(root.join(META).join("journal.tsv")).ok()?;
+    let mut current = rel.to_string();
+    let mut origin = None;
+    // On remonte les déplacements successifs (rangements) jusqu'à l'import.
+    let lines: Vec<String> = BufReader::new(f).lines().map_while(Result::ok).collect();
+    for line in lines.iter().rev() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() == 4 && cols[3] == current {
+            if cols[1] == "rerangé" {
+                let src = PathBuf::from(cols[2]);
+                current = rel_string(src.strip_prefix(root).ok()?)?;
+            } else {
+                origin = Some(cols[2].to_string());
+                break;
+            }
+        }
+    }
+    origin
+}
+
 
 fn rel_string(rel: &Path) -> Option<String> {
     let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();

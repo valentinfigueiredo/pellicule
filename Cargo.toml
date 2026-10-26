@@ -1,6 +1,6 @@
 [package]
 name = "pellicule"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "Rassemble toutes tes photos et vidéos dans un seul album, classé et renommé par date."
 
@@ -26,7 +26,6 @@ rust_h265 = "0.1.0"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
 
 [target."cfg(windows)".dependencies]

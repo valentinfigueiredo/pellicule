@@ -72,9 +72,11 @@ pub fn detect(path: &Path, kind: Kind, ext: &str, mtime: Option<SystemTime>) -> 
     (modified.unwrap_or_default(), Source::Fichier)
 }
 
+/// Une date dans le futur (horloge de l'appareil déréglée, nom trompeur…) est écartée :
+/// on passe à la source suivante. Deux jours de marge pour les fuseaux horaires.
 fn plausible(d: &NaiveDateTime, min_year: i32) -> bool {
-    let max_year = Local::now().year() + 1;
-    (min_year..=max_year).contains(&d.year())
+    let latest = Local::now().naive_local() + chrono::Duration::days(2);
+    d.year() >= min_year && *d <= latest
 }
 
 fn ymd_hms(n: [u32; 6]) -> Option<NaiveDateTime> {

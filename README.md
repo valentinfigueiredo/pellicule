@@ -83,7 +83,15 @@ pellicule trier                           range « À trier » une fois
 pellicule surveiller                      range « À trier » en continu
 pellicule album D:\MonAlbum               change l'emplacement de l'album
 pellicule apercu D:\photo.heic            explique pourquoi un aperçu ne s'affiche pas
+pellicule ranger                          relit les dates et range ce qui n'est pas à sa place
 ```
+
+## Trier
+
+Le bouton « Trier » relit la date de chaque fichier de l'album et remet à sa place ce qui n'y est pas :
+fichiers ajoutés à la main dans le dossier, dates corrigées par une nouvelle version de Pellicule…
+Rien n'est supprimé ; chaque déplacement est noté dans `.pellicule\journal.tsv`.
+Clic droit sur une photo → « Infos » : sa date, d'où elle vient (EXIF, nom, fichier) et son nom d'origine.
 
 ## Comment la date est trouvée
 
@@ -92,6 +100,8 @@ pellicule apercu D:\photo.heic            explique pourquoi un aperçu ne s'affi
 2. **Nom du fichier** : `IMG-20240715-WA0001` (WhatsApp), `PXL_20240715_143208`,
    `Screenshot 2024-07-15 at 14.32.08`…
 3. **Date de modification du fichier**, en dernier recours (signalée « à vérifier »).
+
+Une date dans le futur (horloge de l'appareil déréglée) est ignorée : Pellicule passe à la source suivante.
 
 ## Doublons
 

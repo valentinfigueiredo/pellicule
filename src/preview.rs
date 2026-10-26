@@ -19,11 +19,27 @@ pub fn is_raw(ext: &str) -> bool {
 }
 
 pub fn decode(path: &Path, ext: &str) -> Result<DynamicImage> {
+    // Les décodeurs viennent d'autres projets : un fichier abîmé ne doit pas faire planter Pellicule.
+    let guarded = |f: fn(&Path) -> Result<DynamicImage>| {
+        std::panic::catch_unwind(|| f(path)).unwrap_or_else(|_| Err("le décodeur a planté sur ce fichier".into()))
+    };
     match ext {
-        "heic" | "heif" | "hif" => heic(path),
-        e if is_raw(e) => raw(path),
-        _ => video(path),
+        "heic" | "heif" | "hif" => guarded(heic).or_else(|first| {
+            // Plan B : un JPEG mal nommé, ou la miniature JPEG de l'EXIF.
+            guarded(sniffed).or_else(|_| guarded(raw)).map_err(|_| first)
+        }),
+        e if is_raw(e) => guarded(raw),
+        _ => guarded(video),
     }
+}
+
+/// Décode selon le contenu réel du fichier, quelle que soit son extension.
+fn sniffed(path: &Path) -> Result<DynamicImage> {
+    image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------- HEIC
@@ -44,9 +60,9 @@ fn raw(path: &Path) -> Result<DynamicImage> {
     File::open(path)
         .and_then(|f| f.take(96 << 20).read_to_end(&mut data))
         .map_err(|e| e.to_string())?;
-    let (start, end) = embedded_jpegs(&data).into_iter().max_by_key(|(s, e)| e - s).ok_or("RAW : aucun aperçu intégré")?;
+    let (start, end) = embedded_jpegs(&data).into_iter().max_by_key(|(s, e)| e - s).ok_or("aucun aperçu JPEG intégré")?;
     let mut img = image::load_from_memory_with_format(&data[start..end], image::ImageFormat::Jpeg)
-        .map_err(|e| format!("RAW : aperçu illisible ({e})"))?;
+        .map_err(|e| format!("aperçu JPEG intégré illisible ({e})"))?;
     // L'orientation est dans l'EXIF du RAW, pas toujours dans le JPEG intégré.
     if let Some(o) = raw_orientation(path) {
         img.apply_orientation(o);

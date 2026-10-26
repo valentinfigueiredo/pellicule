@@ -41,6 +41,8 @@ pub fn run(album_flag: Option<PathBuf>, paths: Vec<PathBuf>) -> io::Result<()> {
 
 enum Cmd {
     Import(Vec<PathBuf>),
+    /// Relire les dates et ranger ce qui n'est pas à sa place.
+    Reorganize,
 }
 
 enum Ev {
@@ -79,6 +81,24 @@ fn jobs(root: PathBuf, cmds: Receiver<Cmd>, events: Sender<Ev>, ctx: Context) {
                     send(Ev::Done("Aucune nouvelle photo ni vidéo trouvée.".into()));
                 } else {
                     batch(&mut album, &sources.outside, Mode::Copy, &send);
+                }
+            }
+            Ok(Cmd::Reorganize) => {
+                send(Ev::Status("Vérification des dates…".into()));
+                match album.reorganize(&mut |done, total| {
+                    if done % 20 == 0 || done == total {
+                        send(Ev::Progress(done.min(total.saturating_sub(1)), total));
+                    }
+                }) {
+                    Ok(moved) => {
+                        send(Ev::Loaded(album.files()));
+                        send(Ev::Done(match moved.len() {
+                            0 => "Tout était déjà bien rangé.".into(),
+                            1 => "1 fichier remis à sa place.".into(),
+                            n => format!("{n} fichiers remis à leur place."),
+                        }));
+                    }
+                    Err(e) => send(Ev::Done(format!("Rangement interrompu : {e}"))),
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -251,6 +271,8 @@ struct App {
     icloud_code: String,
     view: View,
     map: map::MapView,
+    /// Fenêtre « Infos » ouverte : (chemin relatif, lignes à afficher).
+    info: Option<(String, Vec<(String, String)>)>,
     /// Photos localisées (chemin relatif → position).
     places: HashMap<String, LatLon>,
     /// Fichiers dont on a déjà cherché la position (avec ou sans résultat).
@@ -317,6 +339,7 @@ impl App {
             icloud_code: String::new(),
             view: if std::env::var_os("PELLICULE_CARTE").is_some() { View::Carte } else { View::Photos },
             map: map::MapView::default(),
+            info: None,
             places: HashMap::new(),
             places_scanned: 0,
             place_tx: None,
@@ -515,6 +538,14 @@ impl App {
                             platform::open(root);
                         }
                     }
+                    let sort = ui
+                        .add_enabled(self.progress.is_none(), egui::Button::new("Trier"))
+                        .on_hover_text("Relit la date de chaque photo et range celles qui ne sont pas à leur place");
+                    if sort.clicked() {
+                        if let Some(cmds) = &self.cmds {
+                            let _ = cmds.send(Cmd::Reorganize);
+                        }
+                    }
                     if ui.button("+  Ajouter des photos…").clicked() {
                         self.add_folder_dialog();
                     }
@@ -540,7 +571,7 @@ impl App {
             });
             if let Some((done, total)) = self.progress {
                 ui.add_space(4.0);
-                ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).text(format!("Import {} / {}", done + 1, total)));
+                ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).text(format!("{} / {}", done + 1, total)));
             }
             ui.add_space(6.0);
         });
@@ -679,6 +710,50 @@ impl App {
                     }
                 }
             });
+    }
+
+    /// Fenêtre « Infos » : d'où vient la date, et le nom du fichier avant son arrivée dans l'album.
+    fn info_window(&mut self, ctx: &Context) {
+        if let Some(rel) = ctx.data_mut(|d| d.remove_temp::<String>(Id::unique("infos"))) {
+            let root = self.root.clone().unwrap_or_default();
+            let path = rel.split('/').fold(root.clone(), |p, c| p.join(c));
+            let mut lines = vec![("Dans l'album".to_string(), rel.replace('/', std::path::MAIN_SEPARATOR_STR))];
+            if let Some(origin) = album::original_name(&root, &rel) {
+                lines.push(("Nom d'origine".into(), origin));
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if let (Some(kind), Ok(meta)) = (crate::date::kind_of(&ext), std::fs::metadata(&path)) {
+                let (when, source) = crate::date::detect(&path, kind, &ext, meta.modified().ok());
+                let source = match source {
+                    crate::date::Source::Exif => "la photo (EXIF)",
+                    crate::date::Source::Video => "la vidéo",
+                    crate::date::Source::Nom => "le nom du fichier",
+                    crate::date::Source::Fichier => "la date du fichier (à vérifier)",
+                };
+                let date = date_label(&format!("{}.x", crate::date::file_stem_for(&when))).unwrap_or_default();
+                lines.push(("Date".into(), date));
+                lines.push(("Trouvée dans".into(), source.into()));
+                lines.push(("Taille".into(), human_bytes(meta.len())));
+            }
+            if let Some(p) = self.places.get(&rel) {
+                lines.push(("Lieu (GPS)".into(), format!("{:.5}, {:.5}", p.0, p.1)));
+            }
+            self.info = Some((rel, lines));
+        }
+        let Some((_, lines)) = &self.info else { return };
+        let mut open = true;
+        egui::Window::new("Infos").open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
+            egui::Grid::new("infos_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                for (k, v) in lines {
+                    ui.weak(k.as_str());
+                    ui.add(egui::Label::new(v.as_str()).wrap());
+                    ui.end_row();
+                }
+            });
+        });
+        if !open {
+            self.info = None;
+        }
     }
 
     fn update_button(&mut self, ui: &mut egui::Ui) {
@@ -853,6 +928,10 @@ pub(crate) fn draw_thumb(ui: &egui::Ui, painter: &egui::Painter, visuals: &egui:
             platform::reveal(&item.path);
             ui.close();
         }
+        if ui.button("Infos (date, nom d'origine)").clicked() {
+            ui.ctx().data_mut(|d| d.insert_temp(Id::unique("infos"), item.rel.clone()));
+            ui.close();
+        }
     });
     resp.on_hover_text(date_label(&item.rel).unwrap_or_else(|| item.rel.clone()));
 }
@@ -947,6 +1026,7 @@ impl eframe::App for App {
         }
 
         self.icloud_window(&ctx);
+        self.info_window(&ctx);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let screen = ctx.content_rect();
