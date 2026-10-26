@@ -13,15 +13,34 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Sans action de ta part, on regarde s'il y a du nouveau sur iCloud toutes les 30 minutes.
+/// Sans action de ta part, on regarde s'il y a du nouveau sur iCloud toutes les 30 minutes…
 const AUTO_SYNC: Duration = Duration::from_secs(30 * 60);
+/// … et on reparcourt toute la photothèque une fois par semaine (photos anciennes ajoutées
+/// récemment, téléchargements ratés).
+const FULL_CHECK: Duration = Duration::from_secs(7 * 24 * 3600);
+
+fn last_full_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("derniere-verification-complete.txt")
+}
+
+fn needs_full_check(dir: &Path) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let last = std::fs::read_to_string(last_full_path(dir)).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    if last.is_none() && dir.join("deja-recuperees.txt").exists() {
+        // Photothèque déjà parcourue avant que Pellicule note la date : on repart de maintenant.
+        let _ = std::fs::write(last_full_path(dir), now.to_string());
+        return false;
+    }
+    last.is_none_or(|t| now.saturating_sub(t) > FULL_CHECK.as_secs())
+}
 
 pub enum Cmd {
     Login { apple_id: String, password: String },
     Code(String),
-    Sync,
+    /// `full` : parcourir toute la photothèque, pas seulement les nouveautés.
+    Sync { full: bool },
     Logout,
 }
 
@@ -31,7 +50,7 @@ pub enum State {
     LoggedOut { apple_id: String, error: Option<String> },
     NeedCode { error: Option<String> },
     Ready { apple_id: String, last: Option<String> },
-    Syncing { seen: u64, total: u64, downloaded: u64, bytes: u64, speed: u64 },
+    Syncing { seen: u64, total: u64, downloaded: u64, bytes: u64, speed: u64, quick: bool },
 }
 
 pub struct Worker {
@@ -73,9 +92,12 @@ impl Worker {
             loop {
                 let cmd = if pending_sync {
                     pending_sync = false;
-                    Ok(Cmd::Sync)
+                    Ok(Cmd::Sync { full: needs_full_check(&dir) })
                 } else {
-                    rx.recv_timeout(AUTO_SYNC)
+                    match rx.recv_timeout(AUTO_SYNC) {
+                        Err(RecvTimeoutError::Timeout) => Ok(Cmd::Sync { full: needs_full_check(&dir) }),
+                        other => other,
+                    }
                 };
                 match cmd {
                     Ok(Cmd::Login { apple_id, password }) => {
@@ -107,15 +129,26 @@ impl Worker {
                         ready = false;
                         set(State::LoggedOut { apple_id: session.apple_id.clone(), error: None });
                     }
-                    Ok(Cmd::Sync) | Err(RecvTimeoutError::Timeout) if ready => {
+                    Ok(Cmd::Sync { full }) if ready => {
                         sp.store(false, Ordering::Relaxed);
-                        set(State::Syncing { seen: 0, total: 0, downloaded: 0, bytes: 0, speed: 0 });
-                        let result = sync::run(&mut session, &dir, &inbox, &sp, &mut |p| {
-                            set(State::Syncing { seen: p.seen, total: p.total, downloaded: p.downloaded, bytes: p.bytes, speed: p.speed })
+                        set(State::Syncing { seen: 0, total: 0, downloaded: 0, bytes: 0, speed: 0, quick: !full });
+                        let result = sync::run(&mut session, &dir, &inbox, full, &sp, &mut |p| {
+                            set(State::Syncing {
+                                seen: p.seen,
+                                total: p.total,
+                                downloaded: p.downloaded,
+                                bytes: p.bytes,
+                                speed: p.speed,
+                                quick: p.quick,
+                            })
                         });
                         let apple_id = session.apple_id.clone();
                         match result {
                             Ok(s) => {
+                                if s.complete {
+                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                                    let _ = std::fs::write(last_full_path(&dir), now.to_string());
+                                }
                                 let mut msg = match s.downloaded {
                                     0 => "Tout est déjà dans ta pellicule.".to_string(),
                                     1 => "1 nouvelle photo/vidéo récupérée.".to_string(),
@@ -127,6 +160,7 @@ impl Worker {
                                 if sp.load(Ordering::Relaxed) {
                                     msg = format!("Arrêté. {msg}");
                                 }
+                                msg += &format!(" (vérifié à {})", chrono::Local::now().format("%H:%M"));
                                 set(State::Ready { apple_id, last: Some(msg) });
                             }
                             Err(Error::NeedLogin(m)) => {
@@ -136,7 +170,8 @@ impl Worker {
                             Err(e) => set(State::Ready { apple_id, last: Some(e.to_string()) }),
                         }
                     }
-                    Ok(Cmd::Sync) | Err(RecvTimeoutError::Timeout) => {}
+                    Ok(Cmd::Sync { .. }) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
                 if ready && !pending_sync && matches!(*st.lock().unwrap(), State::Busy(_) | State::NeedCode { .. }) {

@@ -520,6 +520,8 @@ impl App {
                     }
                     if let Some(worker) = &self.icloud {
                         let label = match worker.state() {
+                            icloud::State::Syncing { quick: true, downloaded: 0, .. } => "iCloud…".into(),
+                            icloud::State::Syncing { quick: true, downloaded, .. } => format!("iCloud +{}", spaced(downloaded as usize)),
                             icloud::State::Syncing { seen, total, .. } => format!("iCloud {} / {}", spaced(seen as usize), spaced(total as usize)),
                             icloud::State::Ready { .. } => "iCloud connecté".into(),
                             icloud::State::NeedCode { .. } => "iCloud : code".into(),
@@ -632,20 +634,35 @@ impl App {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("Récupérer les nouveautés").clicked() {
-                                worker.send(icloud::Cmd::Sync);
+                                worker.send(icloud::Cmd::Sync { full: false });
+                            }
+                            if ui
+                                .button("Tout revérifier")
+                                .on_hover_text("Parcourt toute la photothèque : photos anciennes ajoutées récemment, téléchargements ratés…")
+                                .clicked()
+                            {
+                                worker.send(icloud::Cmd::Sync { full: true });
                             }
                             if ui.button("Se déconnecter").clicked() {
                                 worker.send(icloud::Cmd::Logout);
                             }
                         });
                         ui.add_space(6.0);
-                        ui.weak("Tant que Pellicule est ouverte, elle regarde aussi toute seule toutes les 30 minutes.");
+                        ui.weak("Pellicule regarde toute seule s'il y a du nouveau à chaque lancement et toutes les 30 minutes, et reparcourt toute la photothèque une fois par semaine.");
                     }
-                    icloud::State::Syncing { seen, total, downloaded, bytes, speed } => {
-                        ui.label("Lecture de ta photothèque iCloud…");
-                        ui.add_space(6.0);
-                        let frac = if total > 0 { seen as f32 / total as f32 } else { 0.0 };
-                        ui.add(egui::ProgressBar::new(frac).text(format!("{} / {}", spaced(seen as usize), spaced(total as usize))));
+                    icloud::State::Syncing { seen, total, downloaded, bytes, speed, quick } => {
+                        if quick {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Recherche des nouveautés sur iCloud…");
+                            });
+                            ui.weak(format!("{} éléments récents vérifiés (ta photothèque en compte {})", spaced(seen as usize), spaced(total as usize)));
+                        } else {
+                            ui.label("Lecture de toute ta photothèque iCloud…");
+                            ui.add_space(6.0);
+                            let frac = if total > 0 { seen as f32 / total as f32 } else { 0.0 };
+                            ui.add(egui::ProgressBar::new(frac).text(format!("{} / {}", spaced(seen as usize), spaced(total as usize))));
+                        }
                         ui.label(format!(
                             "{} nouvelle{} récupérée{} · {} reçus · {}/s",
                             spaced(downloaded as usize),

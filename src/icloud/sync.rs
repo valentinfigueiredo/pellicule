@@ -14,6 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const PARALLEL: usize = 4;
 /// Essais par fichier avant d'abandonner (il sera retenté à la prochaine synchronisation).
 const ATTEMPTS: u32 = 3;
+/// Recherche rapide : on s'arrête après autant d'éléments d'affilée déjà récupérés.
+/// iCloud liste du plus récent au plus ancien, donc les nouveautés sont au début.
+const QUICK_STOP: u64 = 300;
 
 pub struct Progress {
     /// Éléments de la photothèque parcourus.
@@ -25,11 +28,15 @@ pub struct Progress {
     pub bytes: u64,
     /// Débit moyen sur les dernières secondes (octets/s).
     pub speed: u64,
+    /// Recherche rapide des nouveautés (sinon : toute la photothèque est parcourue).
+    pub quick: bool,
 }
 
 pub struct Summary {
     pub downloaded: u64,
     pub errors: u64,
+    /// Toute la photothèque a été parcourue jusqu'au bout.
+    pub complete: bool,
 }
 
 /// `state` : dossier de travail (`.pellicule/icloud`). `inbox` : la boîte « À trier ».
@@ -37,6 +44,7 @@ pub fn run(
     session: &mut Session,
     state: &Path,
     inbox: &Path,
+    full: bool,
     stop: &AtomicBool,
     report: &mut dyn FnMut(&Progress),
 ) -> Result<Summary> {
@@ -50,21 +58,54 @@ pub fn run(
     fs::create_dir_all(&tmp).map_err(|e| Error::Other(e.to_string()))?;
     fs::create_dir_all(inbox).map_err(|e| Error::Other(e.to_string()))?;
 
+    // Première fois : il faut tout parcourir.
+    let quick = !full && !known.is_empty();
     let total = session.count()?;
     let downloader = session.downloader();
     let received = AtomicU64::new(0);
     let mut speed = Speed::default();
-    let mut p = Progress { seen: 0, total, downloaded: 0, bytes: 0, speed: 0 };
+    let mut p = Progress { seen: 0, total, downloaded: 0, bytes: 0, speed: 0, quick };
     let mut errors = 0;
+    let mut known_streak = 0u64;
+    let mut reached_end = false;
     report(&p);
 
-    let mut offset = 0;
+    // Les nouveautés doivent être vues en premier. On vérifie le sens de la liste sur la
+    // première page : si elle commence par les plus anciennes, la recherche rapide part de la fin.
+    let first = session.page(0)?;
+    let backward = quick && !newest_first(&first);
+    let mut first_page = (!backward).then_some(first);
+    let mut offset: i64 = if backward { total as i64 - PAGE as i64 } else { 0 };
     while !stop.load(Ordering::Relaxed) {
-        let page = session.page(offset)?;
-        if page.is_empty() {
+        if quick && known_streak >= QUICK_STOP {
             break;
         }
-        offset += page.len() as u64;
+        let page = if backward {
+            if offset <= -(PAGE as i64) {
+                reached_end = true;
+                break;
+            }
+            let start = offset.max(0) as u64;
+            let mut page = session.page(start)?;
+            page.truncate((offset + PAGE as i64 - start as i64) as usize);
+            page.reverse();
+            offset -= PAGE as i64;
+            page
+        } else {
+            let page = match first_page.take() {
+                Some(p) => p,
+                None => session.page(offset as u64)?,
+            };
+            offset += page.len() as i64;
+            page
+        };
+        if page.is_empty() {
+            reached_end = true;
+            break;
+        }
+        for a in &page {
+            known_streak = if known.contains(&a.id) { known_streak + 1 } else { 0 };
+        }
         let (new, already): (Vec<Asset>, Vec<Asset>) = page.into_iter().partition(|a| !known.contains(&a.id));
         p.seen += already.len() as u64;
         report(&p);
@@ -117,7 +158,20 @@ pub fn run(
         });
     }
     let _ = fs::remove_dir_all(&tmp);
-    Ok(Summary { downloaded: p.downloaded, errors })
+    let complete = reached_end && !stop.load(Ordering::Relaxed);
+    Ok(Summary { downloaded: p.downloaded, errors, complete })
+}
+
+/// Éléments par page renvoyés par iCloud (200 enregistrements = 100 photos + leurs fiches).
+const PAGE: u64 = 100;
+
+/// La page va-t-elle du plus récent au plus ancien ?
+fn newest_first(page: &[Asset]) -> bool {
+    let dates: Vec<i64> = page.iter().map(|a| a.date_ms).filter(|&d| d > 0).collect();
+    match (dates.first(), dates.last()) {
+        (Some(a), Some(b)) => a >= b,
+        _ => true,
+    }
 }
 
 /// Télécharge dans le dossier temporaire, avec plusieurs essais.
