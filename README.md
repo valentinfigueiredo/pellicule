@@ -36,6 +36,19 @@ gratuites « HEIF Image Extensions » et « HEVC Video Extensions » du Microsof
 Si un aperçu manque, la raison est notée dans `.pellicule\apercus.log`, et
 `pellicule apercu <fichier>` (dans un terminal) explique ce qui coince.
 
+## Carte
+
+Onglet « Carte » en haut : tes photos sur une carte, regroupées par lieu, comme dans l'app Photos.
+Glisser pour se déplacer, molette (ou pincer) pour zoomer, double-clic pour zoomer sur un endroit.
+Clic sur une bulle : ses photos s'affichent à droite. Bouton « Tout » : voir toutes les photos.
+
+- La position vient du GPS enregistré dans la photo (EXIF) ou la vidéo (iPhone et Android).
+  Les photos sans GPS (envoyées par WhatsApp, captures d'écran…) n'apparaissent pas sur la carte.
+- Pellicule lit les positions en arrière-plan au premier lancement, puis les garde dans `.pellicule\lieux.tsv`.
+- Fond de carte © les contributeurs d'OpenStreetMap. Les tuiles affichées sont gardées dans
+  `.pellicule\carte` (consultables hors ligne). Afficher la carte demande à openstreetmap.org
+  les zones regardées — jamais tes photos ni leurs positions.
+
 ## iCloud Photos
 
 Bouton « Connecter iCloud » en haut de la fenêtre : identifiant Apple, mot de passe, puis le code à
@@ -93,9 +106,11 @@ cargo build --release                                   # pour la machine actuel
 cargo build --release --target x86_64-pc-windows-gnu    # pellicule.exe (depuis macOS : brew install mingw-w64)
 cargo test
 PELLICULE_CAPTURE=ecran.png cargo run --release -- --album <album>   # capture de la fenêtre (hors Windows)
+# + PELLICULE_CARTE=1 (ou =selection) pour la carte, PELLICULE_ICLOUD=1 pour la fenêtre iCloud
 ```
 
 Code : `album.rs` (index, doublons, rangement), `date.rs` (EXIF, QuickTime, noms), `gui.rs` (fenêtre),
-`thumbs.rs` (miniatures), `update.rs` (mise à jour), `cli.rs` (commandes).
+`thumbs.rs` (miniatures), `map.rs` + `place.rs` (carte, GPS), `icloud/` (iCloud Photos),
+`update.rs` (mise à jour), `cli.rs` (commandes).
 
 Publier une version : augmenter `version` dans `Cargo.toml`, recompiler `dist/pellicule.exe`, pousser sur `master`.

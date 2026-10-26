@@ -10,6 +10,8 @@ mod config;
 mod date;
 mod gui;
 mod icloud;
+mod map;
+mod place;
 mod platform;
 mod thumbs;
 mod update;

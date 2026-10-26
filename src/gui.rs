@@ -2,7 +2,8 @@
 //! groupées par mois. Les imports et la surveillance de « À trier » tournent en arrière-plan.
 
 use crate::album::{self, Album, InboxWatcher, Mode, Outcome};
-use crate::{config, icloud, platform, thumbs, update};
+use crate::place::{self, LatLon};
+use crate::{config, icloud, map, platform, thumbs, update};
 use eframe::egui::{
     self, Align, Align2, Color32, Context, CornerRadius, FontId, Id, LayerId, Layout, Order, Rect,
     Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2,
@@ -126,12 +127,12 @@ fn batch(album: &mut Album, files: &[PathBuf], mode: Mode, send: &dyn Fn(Ev)) {
 
 // ------------------------------------------------------------------ modèle
 
-struct Item {
-    rel: String,
-    path: PathBuf,
-    video: bool,
+pub(crate) struct Item {
+    pub rel: String,
+    pub path: PathBuf,
+    pub video: bool,
     /// `2023-08`, ou vide si le fichier n'est pas rangé par date.
-    month: String,
+    pub month: String,
 }
 
 impl Item {
@@ -156,7 +157,7 @@ impl Item {
     }
 }
 
-fn month_label(month: &str) -> String {
+pub(crate) fn month_label(month: &str) -> String {
     let m: usize = month.get(5..7).and_then(|m| m.parse().ok()).unwrap_or(0);
     match MONTHS.get(m.wrapping_sub(1)) {
         Some(name) => {
@@ -214,7 +215,7 @@ impl Grid {
     }
 }
 
-enum Thumb {
+pub(crate) enum Thumb {
     Ready(TextureHandle),
     Missing,
 }
@@ -248,6 +249,42 @@ struct App {
     icloud_id: String,
     icloud_pwd: String,
     icloud_code: String,
+    view: View,
+    map: map::MapView,
+    /// Photos localisées (chemin relatif → position).
+    places: HashMap<String, LatLon>,
+    /// Fichiers dont on a déjà cherché la position (avec ou sans résultat).
+    places_scanned: usize,
+    place_tx: Option<Sender<Vec<String>>>,
+    place_rx: Option<Receiver<Vec<(String, Option<LatLon>)>>>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum View {
+    Photos,
+    Carte,
+}
+
+/// Cherche en arrière-plan où chaque fichier a été pris, en commençant par les plus récents.
+fn places_worker(root: PathBuf, rels: Receiver<Vec<String>>, out: Sender<Vec<(String, Option<LatLon>)>>, ctx: Context) {
+    let mut index = place::Index::load(&root);
+    let _ = out.send(index.known.iter().map(|(r, p)| (r.clone(), *p)).collect());
+    ctx.request_repaint();
+    for batch in rels.iter() {
+        let todo: Vec<String> = batch.into_iter().filter(|r| !index.known.contains_key(r)).collect();
+        for chunk in todo.chunks(200) {
+            let found: Vec<(String, Option<LatLon>)> = chunk
+                .iter()
+                .map(|rel| (rel.clone(), place::locate(&rel.split('/').fold(root.clone(), |p, c| p.join(c)))))
+                .collect();
+            index.known.extend(found.iter().cloned());
+            index.save();
+            if out.send(found).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+    }
 }
 
 impl App {
@@ -278,6 +315,12 @@ impl App {
             icloud_id: String::new(),
             icloud_pwd: String::new(),
             icloud_code: String::new(),
+            view: if std::env::var_os("PELLICULE_CARTE").is_some() { View::Carte } else { View::Photos },
+            map: map::MapView::default(),
+            places: HashMap::new(),
+            places_scanned: 0,
+            place_tx: None,
+            place_rx: None,
         };
         if let Some(root) = root {
             app.start(ctx, root);
@@ -294,6 +337,12 @@ impl App {
             let _ = cmd_tx.send(Cmd::Import(std::mem::take(&mut self.pending)));
         }
         self.icloud = Some(icloud::Worker::start(&root, ctx.clone()));
+        let (place_tx, place_rels) = mpsc::channel();
+        let (place_out, place_rx) = mpsc::channel();
+        let (r, c) = (root.clone(), ctx.clone());
+        std::thread::spawn(move || places_worker(r, place_rels, place_out, c));
+        self.place_tx = Some(place_tx);
+        self.place_rx = Some(place_rx);
         self.root = Some(root);
         self.cmds = Some(cmd_tx);
         self.events = Some(ev_rx);
@@ -310,15 +359,18 @@ impl App {
         let Some(events) = &self.events else { return };
         let root = self.root.clone().unwrap_or_default();
         let mut changed = false;
+        let mut to_locate = Vec::new();
         for ev in events.try_iter() {
             match ev {
                 Ev::Loaded(files) => {
+                    to_locate.extend(files.iter().rev().cloned());
                     self.items = files.into_iter().map(|rel| Item::new(&root, rel)).collect();
                     self.loaded = true;
                     self.status = String::new();
                     changed = true;
                 }
                 Ev::Added(rel) => {
+                    to_locate.push(rel.clone());
                     self.items.push(Item::new(&root, rel));
                     changed = true;
                 }
@@ -328,6 +380,20 @@ impl App {
                     self.status = msg;
                 }
                 Ev::Status(msg) => self.status = msg,
+            }
+        }
+        if let (false, Some(tx)) = (to_locate.is_empty(), &self.place_tx) {
+            let _ = tx.send(to_locate);
+        }
+        if let Some(rx) = &self.place_rx {
+            for batch in rx.try_iter() {
+                self.places_scanned += batch.len();
+                for (rel, p) in batch {
+                    match p {
+                        Some(p) => self.places.insert(rel, p),
+                        None => self.places.remove(&rel),
+                    };
+                }
             }
         }
         if changed {
@@ -428,8 +494,20 @@ impl App {
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("Pellicule").strong());
                 ui.add_space(10.0);
-                let (photos, videos) = self.counts;
-                ui.weak(format!("{} photo{} · {} vidéo{}", spaced(photos), plural(photos), spaced(videos), plural(videos)));
+                ui.selectable_value(&mut self.view, View::Photos, "Photos");
+                ui.selectable_value(&mut self.view, View::Carte, "Carte");
+                ui.add_space(10.0);
+                if self.view == View::Carte {
+                    let n = self.places.len();
+                    let mut text = format!("{} photo{} localisée{}", spaced(n), plural(n), plural(n));
+                    if self.places_scanned < self.items.len() {
+                        text += &format!(" · recherche des lieux {} / {}", spaced(self.places_scanned), spaced(self.items.len()));
+                    }
+                    ui.weak(text);
+                } else {
+                    let (photos, videos) = self.counts;
+                    ui.weak(format!("{} photo{} · {} vidéo{}", spaced(photos), plural(photos), spaced(videos), plural(videos)));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Ouvrir le dossier").clicked() {
                         if let Some(root) = &self.root {
@@ -718,7 +796,7 @@ impl App {
     }
 }
 
-fn draw_thumb(ui: &egui::Ui, painter: &egui::Painter, visuals: &egui::Visuals, rect: Rect, item: &Item, thumb: Option<&Thumb>) {
+pub(crate) fn draw_thumb(ui: &egui::Ui, painter: &egui::Painter, visuals: &egui::Visuals, rect: Rect, item: &Item, thumb: Option<&Thumb>) {
     let radius = CornerRadius::same(4);
     let resp = ui.interact(rect, Id::unique(("vignette", &item.rel)), Sense::click());
     match thumb {
@@ -760,7 +838,7 @@ fn draw_thumb(ui: &egui::Ui, painter: &egui::Painter, visuals: &egui::Visuals, r
 }
 
 /// Recadre au centre pour remplir un carré (comme la pellicule d'un téléphone).
-fn cover_uv(size: Vec2) -> Rect {
+pub(crate) fn cover_uv(size: Vec2) -> Rect {
     if size.x > size.y {
         let w = size.y / size.x;
         Rect::from_min_max(pos2((1.0 - w) / 2.0, 0.0), pos2((1.0 + w) / 2.0, 1.0))
@@ -788,7 +866,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// 12345 → « 12 345 ».
-fn spaced(n: usize) -> String {
+pub(crate) fn spaced(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -826,13 +904,27 @@ impl eframe::App for App {
 
         self.top_bar(ui);
         self.status_bar(ui);
+        let mut wanted = Vec::new();
+        if self.view == View::Carte {
+            self.map.side_panel(ui, &self.items, &self.thumbs, &mut wanted);
+        }
         egui::CentralPanel::default_margins().frame(egui::Frame::central_panel(ui.style()).inner_margin(0)).show(ui, |ui| {
-            if self.items.is_empty() {
+            if self.view == View::Carte {
+                let root = self.root.clone().unwrap_or_default();
+                let scanning = self.places_scanned < self.items.len();
+                self.map.show(ui, &root, &self.items, &self.places, &self.thumbs, &mut wanted, scanning);
+            } else if self.items.is_empty() {
                 self.empty_screen(ui);
             } else {
                 self.gallery(ui);
             }
         });
+        if self.view == View::Carte {
+            if self.thumbs.len() > MAX_TEXTURES * 2 {
+                self.thumbs.clear();
+            }
+            self.loader.want(wanted);
+        }
 
         self.icloud_window(&ctx);
 

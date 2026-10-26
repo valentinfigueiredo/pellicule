@@ -111,7 +111,7 @@ fn exif_date(path: &Path) -> Option<NaiveDateTime> {
 
 // ---------------------------------------------------------------- Vidéo (MP4 / MOV)
 
-fn is_quicktime(ext: &str) -> bool {
+pub(crate) fn is_quicktime(ext: &str) -> bool {
     matches!(ext, "mp4" | "mov" | "m4v" | "3gp" | "3g2")
 }
 
@@ -119,6 +119,11 @@ fn is_quicktime(ext: &str) -> bool {
 const QT_EPOCH: i64 = 2_082_844_800;
 
 fn quicktime_date(path: &Path) -> Option<NaiveDateTime> {
+    parse_moov(&read_moov(path)?)
+}
+
+/// Le contenu de la boîte `moov` d'un MP4/MOV (les métadonnées de la vidéo).
+pub(crate) fn read_moov(path: &Path) -> Option<Vec<u8>> {
     let mut f = File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let mut pos = 0u64;
@@ -150,14 +155,14 @@ fn quicktime_date(path: &Path) -> Option<NaiveDateTime> {
             }
             let mut body = vec![0u8; body_len as usize];
             f.read_exact(&mut body).ok()?;
-            return parse_moov(&body);
+            return Some(body);
         }
         pos += size;
     }
     None
 }
 
-fn children(mut d: &[u8]) -> Vec<([u8; 4], &[u8])> {
+pub(crate) fn children(mut d: &[u8]) -> Vec<([u8; 4], &[u8])> {
     let mut out = Vec::new();
     while d.len() >= 8 {
         let size = u32::from_be_bytes(d[0..4].try_into().unwrap()) as usize;
@@ -180,7 +185,11 @@ fn children(mut d: &[u8]) -> Vec<([u8; 4], &[u8])> {
 fn parse_moov(moov: &[u8]) -> Option<NaiveDateTime> {
     let kids = children(moov);
     // iPhone : heure locale exacte (avec fuseau) dans moov/meta.
-    let apple = kids.iter().filter(|(t, _)| t == b"meta").find_map(|(_, b)| apple_creation_date(b));
+    let apple = kids
+        .iter()
+        .filter(|(t, _)| t == b"meta")
+        .find_map(|(_, b)| apple_key(b, b"com.apple.quicktime.creationdate"))
+        .and_then(parse_stamp);
     if let Some(d) = apple.filter(|d| plausible(d, 1971)) {
         return Some(d);
     }
@@ -197,7 +206,8 @@ fn parse_moov(moov: &[u8]) -> Option<NaiveDateTime> {
     Some(utc.with_timezone(&Local).naive_local())
 }
 
-fn apple_creation_date(meta: &[u8]) -> Option<NaiveDateTime> {
+/// La valeur d'une clé Apple (`com.apple.quicktime.…`) dans une boîte `meta`.
+pub(crate) fn apple_key<'a>(meta: &'a [u8], wanted: &[u8]) -> Option<&'a [u8]> {
     // Le `meta` QuickTime n'a pas d'en-tête version/flags, celui de l'ISO en a un.
     let meta = if meta.get(4..8)? == b"hdlr" { meta } else { meta.get(4..)? };
     let kids = children(meta);
@@ -211,7 +221,7 @@ fn apple_creation_date(meta: &[u8]) -> Option<NaiveDateTime> {
         if sz < 8 || p + sz > keys.len() {
             break;
         }
-        if &keys[p + 8..p + sz] == b"com.apple.quicktime.creationdate" {
+        if &keys[p + 8..p + sz] == wanted {
             index = Some(i);
             break;
         }
@@ -225,7 +235,8 @@ fn apple_creation_date(meta: &[u8]) -> Option<NaiveDateTime> {
         .filter(|(t, _)| u32::from_be_bytes(*t) == index)
         .flat_map(|(_, item)| children(item))
         .filter(|(t, d)| t == b"data" && d.len() > 8)
-        .find_map(|(_, d)| parse_stamp(&d[8..]))
+        .map(|(_, d)| &d[8..])
+        .next()
 }
 
 // ---------------------------------------------------------------- Nom du fichier
