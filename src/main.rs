@@ -13,6 +13,7 @@ mod icloud;
 mod map;
 mod place;
 mod platform;
+mod preview;
 mod thumbs;
 mod update;
 

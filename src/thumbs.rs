@@ -1,10 +1,12 @@
 //! Chargement des miniatures en arrière-plan.
 //!
-//! Les formats courants (JPEG, PNG, WebP, GIF, BMP, TIFF) sont décodés par Pellicule.
-//! Pour le reste (HEIC, RAW, vidéos), on demande la miniature à Windows
+//! Pellicule décode elle-même les formats courants (JPEG, PNG, WebP, GIF, BMP, TIFF),
+//! les HEIC, les RAW et les vidéos MP4/MOV (voir `preview.rs`).
+//! Pour le reste (AVI, WMV, MKV…), on demande la miniature à Windows
 //! (IShellItemImageFactory), qui s'appuie sur les codecs installés.
 
 use eframe::egui::{ColorImage, Context};
+use image::DynamicImage;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -31,23 +33,33 @@ pub struct Loader {
     decode: Shared,
     shell: Shared,
     results: Receiver<Loaded>,
+    cache: Cache,
 }
+
+/// Dossier des miniatures déjà calculées (`.pellicule/miniatures`), connu une fois l'album ouvert.
+type Cache = Arc<Mutex<Option<PathBuf>>>;
 
 impl Loader {
     pub fn new(ctx: Context) -> Loader {
         let (tx, results) = mpsc::channel();
+        let cache: Cache = Arc::new(Mutex::new(None));
         let spawn = |n: usize, via_shell: bool| {
             let q: Shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
             for _ in 0..n {
-                let (q, tx, ctx) = (q.clone(), tx.clone(), ctx.clone());
-                std::thread::spawn(move || worker(q, tx, ctx, via_shell));
+                let (q, tx, ctx, cache) = (q.clone(), tx.clone(), ctx.clone(), cache.clone());
+                std::thread::spawn(move || worker(q, tx, ctx, via_shell, cache));
             }
             q
         };
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         let decode = spawn(cpus.clamp(2, 6), false);
         let shell = spawn(if cfg!(windows) { 2 } else { 0 }, true);
-        Loader { decode, shell, results }
+        Loader { decode, shell, results, cache }
+    }
+
+    pub fn set_cache(&self, dir: PathBuf) {
+        let _ = std::fs::create_dir_all(&dir);
+        *self.cache.lock().unwrap() = Some(dir);
     }
 
     /// Remplace les files d'attente par ce qui est visible maintenant (le plus urgent en premier).
@@ -67,10 +79,9 @@ impl Loader {
     }
 }
 
-fn worker(queue: Shared, tx: Sender<Loaded>, ctx: Context, via_shell: bool) {
-    if via_shell {
-        init_thread();
-    }
+fn worker(queue: Shared, tx: Sender<Loaded>, ctx: Context, via_shell: bool, cache: Cache) {
+    // Aussi pour l'équipe « décodage » : elle se rabat sur Windows si elle n'y arrive pas.
+    init_thread();
     let (lock, cv) = &*queue;
     loop {
         let (rel, path) = {
@@ -83,7 +94,12 @@ fn worker(queue: Shared, tx: Sender<Loaded>, ctx: Context, via_shell: bool) {
                 q = cv.wait(q).unwrap();
             }
         };
-        let image = if via_shell { load_shell(&path) } else { decode(&path, SIZE) };
+        let image = if via_shell {
+            load_shell(&path)
+        } else {
+            let dir = cache.lock().unwrap().clone();
+            load_own(&path, dir.as_deref())
+        };
         lock.lock().unwrap().busy.remove(&rel);
         if tx.send((rel, image)).is_err() {
             return;
@@ -92,10 +108,47 @@ fn worker(queue: Shared, tx: Sender<Loaded>, ctx: Context, via_shell: bool) {
     }
 }
 
+fn ext_of(path: &Path) -> String {
+    path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
+}
+
 /// Formats qu'on sait décoder nous-mêmes.
 fn decodable(path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    matches!(ext.as_str(), "jpg" | "jpeg" | "jpe" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff")
+    let ext = ext_of(path);
+    matches!(ext.as_str(), "jpg" | "jpeg" | "jpe" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff") || crate::preview::handles(&ext)
+}
+
+/// Nos propres décodeurs. Les HEIC, RAW et vidéos sont longs à décoder : leur miniature
+/// est gardée sur le disque. Si on n'y arrive pas, on demande à Windows.
+fn load_own(path: &Path, cache: Option<&Path>) -> Result<ColorImage, String> {
+    let ext = ext_of(path);
+    if !crate::preview::handles(&ext) {
+        return decode(path, SIZE);
+    }
+    let cached = cache.and_then(|dir| {
+        let meta = std::fs::metadata(path).ok()?;
+        let stamp = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let key = xxhash_rust::xxh3::xxh3_64(format!("{}|{}|{stamp}", path.display(), meta.len()).as_bytes());
+        Some(dir.join(format!("{key:016x}.jpg")))
+    });
+    if let Some(img) = cached.as_ref().and_then(|c| image::open(c).ok()) {
+        return Ok(to_color_image(img));
+    }
+    match crate::preview::decode(path, &ext) {
+        Ok(img) => {
+            let thumb = img.thumbnail(SIZE, SIZE);
+            if let Some(c) = &cached {
+                let _ = DynamicImage::ImageRgb8(thumb.to_rgb8()).save_with_format(c, image::ImageFormat::Jpeg);
+            }
+            Ok(to_color_image(thumb))
+        }
+        Err(own) => load_shell(path).map_err(|shell| if cfg!(windows) { format!("{own} ; Windows : {shell}") } else { own }),
+    }
+}
+
+fn to_color_image(img: DynamicImage) -> ColorImage {
+    let t = img.to_rgba8();
+    ColorImage::from_rgba_unmultiplied([t.width() as usize, t.height() as usize], t.as_raw())
 }
 
 pub fn init_thread() {
@@ -109,14 +162,14 @@ fn load_shell(path: &Path) -> Result<ColorImage, String> {
 }
 
 #[cfg(not(windows))]
-fn load_shell(path: &Path) -> Result<ColorImage, String> {
-    decode(path, SIZE)
+fn load_shell(_path: &Path) -> Result<ColorImage, String> {
+    Err("format non pris en charge".into())
 }
 
 /// Pour `pellicule apercu <fichier>` : essaie chaque méthode et dit ce qui se passe.
 pub fn diagnose(path: &Path) -> Vec<(&'static str, Result<[usize; 2], String>)> {
     init_thread();
-    let mut out = vec![("décodage Pellicule", decode(path, SIZE).map(|i| i.size))];
+    let mut out = vec![("décodage Pellicule", load_own(path, None).map(|i| i.size))];
     if cfg!(windows) {
         out.push(("miniature Windows", load_shell(path).map(|i| i.size)));
     }
@@ -124,7 +177,7 @@ pub fn diagnose(path: &Path) -> Vec<(&'static str, Result<[usize; 2], String>)> 
 }
 
 fn decode(path: &Path, size: u32) -> Result<ColorImage, String> {
-    use image::{DynamicImage, ImageDecoder, ImageReader};
+    use image::{ImageDecoder, ImageReader};
     let reader = ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
     let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
     let orientation = decoder.orientation().ok();

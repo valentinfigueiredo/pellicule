@@ -337,6 +337,7 @@ impl App {
             let _ = cmd_tx.send(Cmd::Import(std::mem::take(&mut self.pending)));
         }
         self.icloud = Some(icloud::Worker::start(&root, ctx.clone()));
+        self.loader.set_cache(root.join(".pellicule").join("miniatures"));
         let (place_tx, place_rels) = mpsc::channel();
         let (place_out, place_rx) = mpsc::channel();
         let (r, c) = (root.clone(), ctx.clone());
@@ -815,7 +816,9 @@ pub(crate) fn draw_thumb(ui: &egui::Ui, painter: &egui::Painter, visuals: &egui:
     if item.video {
         let c = rect.left_bottom() + vec2(18.0, -18.0);
         painter.circle_filled(c, 12.0, Color32::from_black_alpha(150));
-        painter.text(c + vec2(1.0, 0.0), Align2::CENTER_CENTER, "▶", FontId::proportional(12.0), Color32::WHITE);
+        // Triangle « lecture » dessiné à la main (le caractère ▶ manque dans la police).
+        let tri = vec![c + vec2(-3.5, -6.0), c + vec2(6.5, 0.0), c + vec2(-3.5, 6.0)];
+        painter.add(egui::Shape::convex_polygon(tri, Color32::WHITE, Stroke::NONE));
     }
     if resp.hovered() {
         painter.rect_stroke(rect, radius, Stroke::new(2.5, visuals.selection.bg_fill), StrokeKind::Inside);

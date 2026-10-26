@@ -1,6 +1,6 @@
 [package]
 name = "pellicule"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Rassemble toutes tes photos et vidéos dans un seul album, classé et renommé par date."
 
@@ -18,6 +18,9 @@ base64 = "0.23.1"
 getrandom = "0.4.3"
 pbkdf2 = { version = "0.13.0", features = ["hmac"] }
 num-bigint = "0.5.1"
+heif-oxide = "0.1.0"
+rust_h264 = "0.4.0"
+rust_h265 = "0.1.0"
 
 [profile.release]
 opt-level = 3

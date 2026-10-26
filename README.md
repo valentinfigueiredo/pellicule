@@ -1,7 +1,7 @@
 # Pellicule
 
 Un seul album pour toutes tes photos et vidéos, classé et renommé par date, sans doublons.
-Un seul fichier `pellicule.exe` (~6 Mo, écrit en Rust), rien à installer.
+Un seul fichier `pellicule.exe` (~9 Mo, écrit en Rust), rien à installer.
 
 Au lancement, tu as **ta pellicule** : toutes tes miniatures, de la plus récente à la plus ancienne,
 groupées par mois (comme sur un téléphone). Clic sur une photo ou une vidéo pour l'ouvrir,
@@ -30,41 +30,13 @@ Pellicule\
 4. **Au quotidien** : tant que la fenêtre est ouverte, tout ce que tu déposes dans `À trier`
    est renommé, rangé et apparaît dans la pellicule.
 
-Miniatures : JPEG, PNG, WebP, GIF, BMP et TIFF sont décodés par Pellicule. Pour les photos iPhone
-(HEIC), les RAW et les vidéos, Pellicule demande la miniature à Windows : il faut les extensions
-gratuites « HEIF Image Extensions » et « HEVC Video Extensions » du Microsoft Store.
+Aperçus : Pellicule décode elle-même, **sans codec à installer**, les JPEG, PNG, WebP, GIF,
+BMP, TIFF, les **HEIC** de l'iPhone, les **RAW** (aperçu JPEG intégré : CR2, CR3, NEF, ARW, DNG,
+RAF, ORF, RW2…) et les **vidéos MP4/MOV** en H.264 ou HEVC (une image prise vers 10 % de la vidéo).
+Les aperçus HEIC, RAW et vidéo sont gardés dans `.pellicule\miniatures` : la deuxième fois, c'est instantané.
+Pour les autres formats (AVI, WMV, MKV…), Pellicule demande la miniature à Windows.
 Si un aperçu manque, la raison est notée dans `.pellicule\apercus.log`, et
 `pellicule apercu <fichier>` (dans un terminal) explique ce qui coince.
-
-## Carte
-
-Onglet « Carte » en haut : tes photos sur une carte, regroupées par lieu, comme dans l'app Photos.
-Glisser pour se déplacer, molette (ou pincer) pour zoomer, double-clic pour zoomer sur un endroit.
-Clic sur une bulle : ses photos s'affichent à droite. Bouton « Tout » : voir toutes les photos.
-
-- La position vient du GPS enregistré dans la photo (EXIF) ou la vidéo (iPhone et Android).
-  Les photos sans GPS (envoyées par WhatsApp, captures d'écran…) n'apparaissent pas sur la carte.
-- Pellicule lit les positions en arrière-plan au premier lancement, puis les garde dans `.pellicule\lieux.tsv`.
-- Fond de carte © les contributeurs d'OpenStreetMap. Les tuiles affichées sont gardées dans
-  `.pellicule\carte` (consultables hors ligne). Afficher la carte demande à openstreetmap.org
-  les zones regardées — jamais tes photos ni leurs positions.
-
-## iCloud Photos
-
-Bouton « Connecter iCloud » en haut de la fenêtre : identifiant Apple, mot de passe, puis le code à
-6 chiffres reçu sur l'iPhone. Pellicule récupère alors **toute la photothèque iCloud** (originaux),
-puis les nouveautés toutes les 30 minutes tant qu'elle est ouverte. Les fichiers arrivent dans
-`À trier` et sont rangés comme le reste (doublons écartés).
-
-- Connexion **non officielle** (la même que le site icloud.com, reprise d'icloudpd) : Apple peut la
-  casser un jour ; la mise à jour de Pellicule la réparera.
-- Sur l'iPhone : Réglages > ton nom > iCloud : **activer** « Accéder aux données iCloud sur le web »
-  et **désactiver** « Protection avancée des données ».
-- Le mot de passe n'est jamais enregistré. La session est gardée dans `.pellicule\icloud\session.bin`,
-  chiffrée par Windows pour ton compte. Les photos déjà récupérées sont notées dans
-  `deja-recuperees.txt` ; `journal.log` liste les échanges avec Apple (sans aucun secret) en cas de panne.
-- Récupérées : les originaux (photos, vidéos). Pas les retouches, ni les vidéos des Live Photos,
-  ni la photothèque partagée.
 
 Mise à jour : quand une nouvelle version est publiée sur GitHub, un bouton « Mettre à jour » apparaît
 en haut de la fenêtre. Un clic télécharge la nouvelle version et relance Pellicule
@@ -110,7 +82,7 @@ PELLICULE_CAPTURE=ecran.png cargo run --release -- --album <album>   # capture d
 ```
 
 Code : `album.rs` (index, doublons, rangement), `date.rs` (EXIF, QuickTime, noms), `gui.rs` (fenêtre),
-`thumbs.rs` (miniatures), `map.rs` + `place.rs` (carte, GPS), `icloud/` (iCloud Photos),
+`thumbs.rs` + `preview.rs` (miniatures, HEIC/RAW/vidéo), `map.rs` + `place.rs` (carte, GPS), `icloud/` (iCloud Photos),
 `update.rs` (mise à jour), `cli.rs` (commandes).
 
 Publier une version : augmenter `version` dans `Cargo.toml`, recompiler `dist/pellicule.exe`, pousser sur `master`.
