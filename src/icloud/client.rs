@@ -6,7 +6,8 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -109,6 +110,7 @@ pub struct Session {
     data: HashMap<String, String>,
     cookies: Vec<Cookie>,
     account: Value,
+    download_agent: ureq::Agent,
 }
 
 impl Session {
@@ -118,6 +120,14 @@ impl Session {
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_recv_response(Some(Duration::from_secs(90)))
+            .timeout_per_read(Some(Duration::from_secs(60)))
+            .build()
+            .into();
+        // Une connexion qui ne reçoit plus rien pendant 60 s est abandonnée (puis retentée).
+        let download_agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_per_read(Some(Duration::from_secs(60)))
             .build()
             .into();
         let mut s = Session {
@@ -128,6 +138,7 @@ impl Session {
             data: HashMap::new(),
             cookies: Vec::new(),
             account: Value::Null,
+            download_agent,
         };
         let stored = fs::read(dir.join("session.bin")).ok().and_then(|b| crate::platform::unprotect(&b));
         if let Some(v) = stored.and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
@@ -519,8 +530,39 @@ impl Session {
             .collect())
     }
 
-    /// Télécharge un original dans `dest`.
-    pub fn download(&self, url: &str, dest: &Path) -> Result<u64> {
+    /// De quoi télécharger les originaux depuis plusieurs fils à la fois.
+    pub fn downloader(&self) -> Downloader {
+        Downloader { agent: self.download_agent.clone(), dir: self.dir.clone() }
+    }
+}
+
+/// Les originaux se téléchargent sans cookie (adresses signées) : on peut en faire plusieurs en parallèle.
+#[derive(Clone)]
+pub struct Downloader {
+    agent: ureq::Agent,
+    dir: PathBuf,
+}
+
+impl Downloader {
+    /// Télécharge un original dans `dest` ; `received` avance au fil de l'eau.
+    pub fn download(&self, url: &str, dest: &Path, label: &str, received: &AtomicU64) -> Result<u64> {
+        let started = std::time::Instant::now();
+        let host = host_of(url);
+        let result = self.try_download(url, dest, received);
+        let (status, n) = match &result {
+            Ok(n) => ("ok".to_string(), *n),
+            Err(e) => (e.to_string(), 0),
+        };
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        // Une seule écriture par ligne : plusieurs téléchargements écrivent en même temps.
+        let line = format!("{now}\tGET\t{host} {label}\t{status}\t{n} o\t{:.1} s\n", started.elapsed().as_secs_f32());
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.dir.join("journal.log")) {
+            let _ = f.write_all(line.as_bytes());
+        }
+        result
+    }
+
+    fn try_download(&self, url: &str, dest: &Path, received: &AtomicU64) -> Result<u64> {
         let resp = self
             .agent
             .get(url)
@@ -530,10 +572,21 @@ impl Session {
         if !resp.status().is_success() {
             return Err(Error::Other(format!("téléchargement refusé ({})", resp.status())));
         }
-        let mut out = io::BufWriter::new(fs::File::create(dest).map_err(other)?);
-        let n = io::copy(&mut resp.into_body().into_reader(), &mut out).map_err(other)?;
+        let mut reader = resp.into_body().into_reader();
+        let mut out = io::BufWriter::with_capacity(1 << 20, fs::File::create(dest).map_err(other)?);
+        let mut buf = vec![0u8; 256 << 10];
+        let mut total = 0u64;
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| Error::Other(format!("téléchargement coupé : {e}")))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(other)?;
+            total += n as u64;
+            received.fetch_add(n as u64, Ordering::Relaxed);
+        }
         out.flush().map_err(other)?;
-        Ok(n)
+        Ok(total)
     }
 }
 

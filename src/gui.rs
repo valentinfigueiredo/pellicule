@@ -562,12 +562,19 @@ impl App {
                         ui.add_space(6.0);
                         ui.weak("Tant que Pellicule est ouverte, elle regarde aussi toute seule toutes les 30 minutes.");
                     }
-                    icloud::State::Syncing { seen, total, downloaded } => {
+                    icloud::State::Syncing { seen, total, downloaded, bytes, speed } => {
                         ui.label("Lecture de ta photothèque iCloud…");
                         ui.add_space(6.0);
                         let frac = if total > 0 { seen as f32 / total as f32 } else { 0.0 };
                         ui.add(egui::ProgressBar::new(frac).text(format!("{} / {}", spaced(seen as usize), spaced(total as usize))));
-                        ui.label(format!("{} nouvelle{} récupérée{}", spaced(downloaded as usize), plural(downloaded as usize), plural(downloaded as usize)));
+                        ui.label(format!(
+                            "{} nouvelle{} récupérée{} · {} reçus · {}/s",
+                            spaced(downloaded as usize),
+                            plural(downloaded as usize),
+                            plural(downloaded as usize),
+                            human_bytes(bytes),
+                            human_bytes(speed)
+                        ));
                         ui.weak("Elles arrivent dans ta pellicule au fur et à mesure. Tu peux fermer cette fenêtre.");
                         ui.add_space(6.0);
                         if ui.button("Arrêter").clicked() {
@@ -761,6 +768,19 @@ fn cover_uv(size: Vec2) -> Rect {
         let h = size.x / size.y.max(1.0);
         Rect::from_min_max(pos2(0.0, (1.0 - h) / 2.0), pos2(1.0, (1.0 + h) / 2.0))
     }
+}
+
+/// 1536000 → « 1,5 Mo ».
+fn human_bytes(n: u64) -> String {
+    let units = ["o", "Ko", "Mo", "Go", "To"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1000.0 && u < units.len() - 1 {
+        v /= 1000.0;
+        u += 1;
+    }
+    let s = if u == 0 || v >= 100.0 { format!("{v:.0}") } else { format!("{v:.1}") };
+    format!("{} {}", s.replace('.', ","), units[u])
 }
 
 fn plural(n: usize) -> &'static str {

@@ -31,7 +31,7 @@ pub enum State {
     LoggedOut { apple_id: String, error: Option<String> },
     NeedCode { error: Option<String> },
     Ready { apple_id: String, last: Option<String> },
-    Syncing { seen: u64, total: u64, downloaded: u64 },
+    Syncing { seen: u64, total: u64, downloaded: u64, bytes: u64, speed: u64 },
 }
 
 pub struct Worker {
@@ -109,9 +109,9 @@ impl Worker {
                     }
                     Ok(Cmd::Sync) | Err(RecvTimeoutError::Timeout) if ready => {
                         sp.store(false, Ordering::Relaxed);
-                        set(State::Syncing { seen: 0, total: 0, downloaded: 0 });
+                        set(State::Syncing { seen: 0, total: 0, downloaded: 0, bytes: 0, speed: 0 });
                         let result = sync::run(&mut session, &dir, &inbox, &sp, &mut |p| {
-                            set(State::Syncing { seen: p.seen, total: p.total, downloaded: p.downloaded })
+                            set(State::Syncing { seen: p.seen, total: p.total, downloaded: p.downloaded, bytes: p.bytes, speed: p.speed })
                         });
                         let apple_id = session.apple_id.clone();
                         match result {
