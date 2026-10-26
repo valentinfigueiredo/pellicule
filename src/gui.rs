@@ -454,8 +454,9 @@ impl App {
             let log = root.join(".pellicule").join("apercus.log");
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
                 use std::io::Write;
+                let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
                 for line in &failures {
-                    let _ = writeln!(f, "{line}");
+                    let _ = writeln!(f, "{now}\tv{}\t{line}", update::CURRENT);
                 }
             }
         }

@@ -123,7 +123,19 @@ fn decodable(path: &Path) -> bool {
 fn load_own(path: &Path, cache: Option<&Path>) -> Result<ColorImage, String> {
     let ext = ext_of(path);
     if !crate::preview::handles(&ext) {
-        return decode(path, SIZE);
+        // Plans B : image décalée dans le fichier, puis Windows (TIFF à palette…).
+        return decode(path, SIZE).or_else(|first| {
+            let salvaged = std::panic::catch_unwind(|| crate::preview::salvage(path))
+                .unwrap_or_else(|_| Err("le décodeur a planté".into()));
+            match salvaged {
+                Ok(img) => Ok(to_color_image(img.thumbnail(SIZE, SIZE))),
+                // Que des zéros : inutile de demander à Windows.
+                Err(e) if e.contains("zéros") && !e.contains("début") => Err(e),
+                Err(e) => load_shell(path).map_err(|shell| {
+                    if cfg!(windows) { format!("{first} ; {e} ; Windows : {shell}") } else { format!("{first} ; {e}") }
+                }),
+            }
+        });
     }
     let cached = cache.and_then(|dir| {
         let meta = std::fs::metadata(path).ok()?;
@@ -215,9 +227,19 @@ mod shell {
         unsafe {
             let factory: IShellItemImageFactory =
                 SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>).map_err(|e| e.message())?;
-            let bitmap = factory
-                .GetImage(SIZE { cx: size as i32, cy: size as i32 }, SIIGBF_RESIZETOFIT)
-                .map_err(|e| e.message())?;
+            // E_PENDING (« données pas encore disponibles ») : Windows prépare la miniature, on patiente un peu.
+            const E_PENDING: i32 = 0x8000000Au32 as i32;
+            let mut attempt = 0;
+            let bitmap = loop {
+                match factory.GetImage(SIZE { cx: size as i32, cy: size as i32 }, SIIGBF_RESIZETOFIT) {
+                    Ok(b) => break b,
+                    Err(e) if e.code().0 == E_PENDING && attempt < 5 => {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(400 * attempt));
+                    }
+                    Err(e) => return Err(e.message()),
+                }
+            };
             let image = to_image(bitmap);
             let _ = DeleteObject(bitmap.into());
             image

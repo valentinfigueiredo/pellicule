@@ -42,6 +42,37 @@ fn sniffed(path: &Path) -> Result<DynamicImage> {
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------- fichiers abîmés
+
+/// Dernière chance pour un JPEG/PNG illisible : l'image commence parfois plus loin dans le
+/// fichier (octets parasites au début, après une récupération de données ou une vieille copie).
+pub fn salvage(path: &Path) -> Result<DynamicImage> {
+    let mut data = Vec::new();
+    File::open(path)
+        .and_then(|f| f.take(96 << 20).read_to_end(&mut data))
+        .map_err(|e| e.to_string())?;
+    if data.iter().all(|&b| b == 0) {
+        return Err("fichier abîmé : il ne contient que des zéros, l'image est perdue".into());
+    }
+    if let Some((start, end)) = embedded_jpegs(&data).into_iter().max_by_key(|(s, e)| e - s) {
+        if let Ok(img) = image::load_from_memory_with_format(&data[start..end], image::ImageFormat::Jpeg) {
+            return Ok(img);
+        }
+    }
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if let Some(at) = data.windows(PNG.len()).position(|w| w == PNG) {
+        if let Ok(img) = image::load_from_memory_with_format(&data[at..], image::ImageFormat::Png) {
+            return Ok(img);
+        }
+    }
+    let zeros = data.iter().take_while(|&&b| b == 0).count();
+    Err(if zeros > 0 {
+        format!("fichier abîmé : {zeros} octets à zéro au début, et aucune image reconnaissable ensuite")
+    } else {
+        "fichier abîmé : aucune image reconnaissable dedans".into()
+    })
+}
+
 // ---------------------------------------------------------------- HEIC
 
 fn heic(path: &Path) -> Result<DynamicImage> {
