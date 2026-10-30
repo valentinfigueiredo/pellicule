@@ -11,6 +11,8 @@ use xxhash_rust::xxh3::Xxh3;
 
 pub const INBOX: &str = "À trier";
 pub const DUPLICATES: &str = "_Doublons";
+/// Les vidéos des Live Photos iCloud : gardées à part, hors de la pellicule.
+pub const LIVE: &str = "Live Photos";
 const META: &str = ".pellicule";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,7 +73,7 @@ impl Album {
         walk(&root, &mut |path, size| {
             let rel = path.strip_prefix(&root).unwrap();
             let top = rel.components().next().and_then(|c| c.as_os_str().to_str()).unwrap_or("");
-            if rel.components().count() > 1 && (top == INBOX || top == DUPLICATES) {
+            if rel.components().count() > 1 && (top == INBOX || top == DUPLICATES || top == LIVE) {
                 return;
             }
             if let Some(rel) = rel_string(rel) {
@@ -256,7 +258,7 @@ impl Album {
             if let Ok(rd) = fs::read_dir(&self.root) {
                 for e in rd.filter_map(Result::ok) {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    if e.file_type().is_ok_and(|t| t.is_dir()) && !skip_dir(&name) && name != INBOX && name != DUPLICATES {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) && !skip_dir(&name) && name != INBOX && name != DUPLICATES && name != LIVE {
                         prune_empty_dirs(&e.path());
                         let _ = fs::remove_dir(e.path());
                     }

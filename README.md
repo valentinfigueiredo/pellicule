@@ -66,8 +66,9 @@ reparcourt toute la photothèque une fois par semaine, ou avec le bouton « Tout
 - Le mot de passe n'est jamais enregistré. La session est gardée dans `.pellicule\icloud\session.bin`,
   chiffrée par Windows pour ton compte. Les photos déjà récupérées sont notées dans
   `deja-recuperees.txt` ; `journal.log` liste les échanges avec Apple (sans aucun secret) en cas de panne.
-- Récupérées : les originaux (photos, vidéos). Pas les retouches, ni les vidéos des Live Photos,
-  ni la photothèque partagée.
+- Récupérés : les originaux, les **versions retouchées** (`…_retouche`, à côté de l'original dans la
+  pellicule) et les **vidéos des Live Photos**, rangées à part dans `Live Photos\` pour ne pas doubler
+  chaque photo dans la pellicule. Pas la photothèque partagée, ni le 2e fichier d'une paire RAW + JPEG.
 
 Mise à jour : quand une nouvelle version est publiée sur GitHub, un bouton « Mettre à jour » apparaît
 en haut de la fenêtre. Un clic télécharge la nouvelle version et relance Pellicule

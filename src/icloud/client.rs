@@ -95,11 +95,28 @@ impl Reply {
 /// Une photo ou vidéo de la photothèque iCloud.
 pub struct Asset {
     pub id: String,
+    /// Date de prise de vue, en millisecondes depuis 1970.
+    pub date_ms: i64,
+    /// L'original, puis la version retouchée et la vidéo Live s'il y en a.
+    pub resources: Vec<Resource>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Original,
+    Edited,
+    Live,
+}
+
+/// Un fichier à télécharger.
+pub struct Resource {
+    pub kind: Kind,
+    /// Sa clé dans `deja-recuperees.txt`. Celle d'une retouche contient l'empreinte du fichier :
+    /// si tu retouches à nouveau la photo, la nouvelle version est récupérée aussi.
+    pub key: String,
     pub filename: String,
     pub size: u64,
     pub url: String,
-    /// Date de prise de vue, en millisecondes depuis 1970.
-    pub date_ms: i64,
 }
 
 pub struct Session {
@@ -498,36 +515,14 @@ impl Session {
                     "recordType": "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
                 },
                 "resultsLimit": 200,
-                "desiredKeys": ["resOriginalRes", "resOriginalFileType", "itemType", "filenameEnc", "recordName",
-                                "recordType", "masterRef", "assetDate", "addedDate", "isDeleted", "isHidden"],
+                "desiredKeys": ["resOriginalRes", "resOriginalFileType", "resJPEGFullRes", "resJPEGFullFileType",
+                                "resVidFullRes", "resVidFullFileType", "resOriginalVidComplRes", "resOriginalVidComplFileType",
+                                "itemType", "filenameEnc", "recordName", "recordType", "masterRef", "assetDate", "addedDate",
+                                "isDeleted", "isHidden"],
                 "zoneID": {"zoneName": "PrimarySync"}
             }),
         )?;
-        let records = r["records"].as_array().cloned().unwrap_or_default();
-        let dates: HashMap<&str, i64> = records
-            .iter()
-            .filter(|rec| rec["recordType"] == "CPLAsset")
-            .filter_map(|rec| {
-                let master = rec.pointer("/fields/masterRef/value/recordName")?.as_str()?;
-                Some((master, rec.pointer("/fields/assetDate/value").and_then(Value::as_i64).unwrap_or(0)))
-            })
-            .collect();
-        Ok(records
-            .iter()
-            .filter(|rec| rec["recordType"] == "CPLMaster")
-            .filter_map(|m| {
-                let id = m["recordName"].as_str()?.to_string();
-                let res = m.pointer("/fields/resOriginalRes/value")?;
-                let filename = filename_of(m).unwrap_or_else(|| format!("{}.{}", &id[..id.len().min(12)], ext_for(m)));
-                Some(Asset {
-                    filename,
-                    size: res["size"].as_u64().unwrap_or(0),
-                    url: res["downloadURL"].as_str()?.to_string(),
-                    date_ms: dates.get(id.as_str()).copied().unwrap_or(0),
-                    id,
-                })
-            })
-            .collect())
+        Ok(assets_from(r["records"].as_array().map_or(&[], |v| v.as_slice())))
     }
 
     /// De quoi télécharger les originaux depuis plusieurs fils à la fois.
@@ -600,6 +595,77 @@ fn login_error(r: &Reply) -> Error {
     }
 }
 
+/// Assemble les fiches d'une page : `CPLMaster` (l'original) et `CPLAsset` (date, retouches).
+fn assets_from(records: &[Value]) -> Vec<Asset> {
+    let fiches: HashMap<&str, &Value> = records
+        .iter()
+        .filter(|rec| rec["recordType"] == "CPLAsset")
+        .filter_map(|rec| Some((rec.pointer("/fields/masterRef/value/recordName")?.as_str()?, rec)))
+        .collect();
+    records
+        .iter()
+        .filter(|rec| rec["recordType"] == "CPLMaster")
+        .filter_map(|m| {
+            let id = m["recordName"].as_str()?.to_string();
+            let filename = filename_of(m).unwrap_or_else(|| format!("{}.{}", &id[..id.len().min(12)], ext_for(m)));
+            let stem = Path::new(&filename).file_stem().map_or(id.clone(), |s| s.to_string_lossy().into_owned());
+            let fiche = fiches.get(id.as_str()).copied();
+            let video = m.pointer("/fields/itemType/value").and_then(Value::as_str).is_some_and(is_video_type);
+
+            let res = m.pointer("/fields/resOriginalRes/value")?;
+            let mut resources = vec![Resource {
+                kind: Kind::Original,
+                key: id.clone(),
+                filename,
+                size: res["size"].as_u64().unwrap_or(0),
+                url: res["downloadURL"].as_str()?.to_string(),
+            }];
+            // Une retouche est dans la fiche `CPLAsset`, jamais dans l'original.
+            let edited = if video { "resVidFull" } else { "resJPEGFull" };
+            if let Some(r) = fiche.and_then(|f| extra(f, edited, Kind::Edited, &id, &stem, "retouche", if video { "mov" } else { "jpg" })) {
+                resources.push(r);
+            }
+            // La vidéo d'une Live Photo : comme icloudpd, dans la fiche si elle y est, sinon dans l'original.
+            if !video {
+                let live = fiche
+                    .and_then(|f| extra(f, "resOriginalVidCompl", Kind::Live, &id, &stem, "live", "mov"))
+                    .or_else(|| extra(m, "resOriginalVidCompl", Kind::Live, &id, &stem, "live", "mov"));
+                resources.extend(live);
+            }
+            let date_ms = fiche.and_then(|f| f.pointer("/fields/assetDate/value")).and_then(Value::as_i64).unwrap_or(0);
+            Some(Asset { id, date_ms, resources })
+        })
+        .collect()
+}
+
+fn extra(record: &Value, prefix: &str, kind: Kind, id: &str, stem: &str, suffix: &str, default_ext: &str) -> Option<Resource> {
+    let res = record.pointer(&format!("/fields/{prefix}Res/value"))?;
+    let uti = record.pointer(&format!("/fields/{prefix}FileType/value")).and_then(Value::as_str).unwrap_or("");
+    let checksum = res["fileChecksum"].as_str().unwrap_or("");
+    Some(Resource {
+        kind,
+        key: format!("{id}#{suffix}#{checksum}"),
+        filename: format!("{stem}_{suffix}.{}", ext_of_type(uti).unwrap_or(default_ext)),
+        size: res["size"].as_u64().unwrap_or(0),
+        url: res["downloadURL"].as_str()?.to_string(),
+    })
+}
+
+fn is_video_type(uti: &str) -> bool {
+    matches!(uti, "com.apple.quicktime-movie" | "public.mpeg-4")
+}
+
+fn ext_of_type(uti: &str) -> Option<&'static str> {
+    match uti {
+        "public.jpeg" => Some("jpg"),
+        "public.heic" | "public.heif" => Some("heic"),
+        "public.png" => Some("png"),
+        "com.apple.quicktime-movie" => Some("mov"),
+        "public.mpeg-4" => Some("mp4"),
+        _ => None,
+    }
+}
+
 fn filename_of(master: &Value) -> Option<String> {
     let enc = master.pointer("/fields/filenameEnc")?;
     let value = enc["value"].as_str()?;
@@ -613,13 +679,7 @@ fn filename_of(master: &Value) -> Option<String> {
 }
 
 fn ext_for(master: &Value) -> &'static str {
-    match master.pointer("/fields/itemType/value").and_then(Value::as_str).unwrap_or("") {
-        "public.heic" | "public.heif" => "heic",
-        "public.png" => "png",
-        "com.apple.quicktime-movie" => "mov",
-        "public.mpeg-4" => "mp4",
-        _ => "jpg",
-    }
+    ext_of_type(master.pointer("/fields/itemType/value").and_then(Value::as_str).unwrap_or("")).unwrap_or("jpg")
 }
 
 fn host_of(url: &str) -> String {
@@ -650,6 +710,37 @@ mod tests {
         s.store_cookie("X-APPLE-WEBAUTH-TOKEN=; Domain=.icloud.com; Expires=Thu, 01-Jan-1970 00:00:01 GMT", "setup.icloud.com");
         assert_eq!(s.cookies.len(), 1);
         assert_eq!(host_of("https://p42-ckdatabasews.icloud.com:443/database/1"), "p42-ckdatabasews.icloud.com");
+    }
+
+    #[test]
+    fn retouches_et_live() {
+        let res = |url: &str, sum: &str| json!({"value": {"size": 10, "downloadURL": url, "fileChecksum": sum}});
+        let name = |n: &str| json!({"type": "STRING", "value": n});
+        let records = vec![
+            // Photo simple : l'original seul.
+            json!({"recordType": "CPLMaster", "recordName": "A", "fields": {"filenameEnc": name("IMG_1.HEIC"), "itemType": {"value": "public.heic"}, "resOriginalRes": res("u-a", "x")}}),
+            json!({"recordType": "CPLAsset", "fields": {"masterRef": {"value": {"recordName": "A"}}, "assetDate": {"value": 1000}}}),
+            // Live Photo retouchée : original, retouche et vidéo Live.
+            json!({"recordType": "CPLMaster", "recordName": "B", "fields": {"filenameEnc": name("IMG_2.HEIC"), "itemType": {"value": "public.heic"}, "resOriginalRes": res("u-b", "x"),
+                "resOriginalVidComplRes": res("u-b-live", "L"), "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}}}),
+            json!({"recordType": "CPLAsset", "fields": {"masterRef": {"value": {"recordName": "B"}}, "assetDate": {"value": 2000},
+                "resJPEGFullRes": res("u-b-edit", "E"), "resJPEGFullFileType": {"value": "public.heic"}}}),
+            // Vidéo retouchée.
+            json!({"recordType": "CPLMaster", "recordName": "C", "fields": {"filenameEnc": name("IMG_3.MOV"), "itemType": {"value": "com.apple.quicktime-movie"}, "resOriginalRes": res("u-c", "x")}}),
+            json!({"recordType": "CPLAsset", "fields": {"masterRef": {"value": {"recordName": "C"}}, "resVidFullRes": res("u-c-edit", "V"), "resVidFullFileType": {"value": "com.apple.quicktime-movie"}}}),
+        ];
+        let assets = assets_from(&records);
+        let list = |i: usize| -> Vec<(Kind, String, String)> {
+            assets[i].resources.iter().map(|r| (r.kind, r.key.clone(), r.filename.clone())).collect()
+        };
+        assert_eq!(list(0), vec![(Kind::Original, "A".to_string(), "IMG_1.HEIC".to_string())]);
+        assert_eq!(assets[1].date_ms, 2000);
+        assert_eq!(list(1), vec![
+            (Kind::Original, "B".to_string(), "IMG_2.HEIC".to_string()),
+            (Kind::Edited, "B#retouche#E".to_string(), "IMG_2_retouche.heic".to_string()),
+            (Kind::Live, "B#live#L".to_string(), "IMG_2_live.mov".to_string()),
+        ]);
+        assert_eq!(list(2)[1], (Kind::Edited, "C#retouche#V".to_string(), "IMG_3_retouche.mov".to_string()));
     }
 
     #[test]

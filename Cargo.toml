@@ -1,6 +1,6 @@
 [package]
 name = "pellicule"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "Rassemble toutes tes photos et vidéos dans un seul album, classé et renommé par date."
 

@@ -579,7 +579,7 @@ impl App {
     }
 
     fn icloud_window(&mut self, ctx: &Context) {
-        let Self { icloud, icloud_open, icloud_id, icloud_pwd, icloud_code, .. } = self;
+        let Self { icloud, icloud_open, icloud_id, icloud_pwd, icloud_code, root, .. } = self;
         let Some(worker) = icloud.as_ref() else { return };
         let state = worker.state();
         if matches!(state, icloud::State::NeedCode { .. }) {
@@ -679,6 +679,12 @@ impl App {
                                 worker.send(icloud::Cmd::Logout);
                             }
                         });
+                        if let Some(live) = root.as_ref().map(|r| r.join(album::LIVE)).filter(|p| p.is_dir()) {
+                            ui.add_space(6.0);
+                            if ui.link("Ouvrir le dossier des vidéos Live Photos").clicked() {
+                                platform::open(&live);
+                            }
+                        }
                         ui.add_space(6.0);
                         ui.weak("Pellicule regarde toute seule s'il y a du nouveau à chaque lancement et toutes les 30 minutes, et reparcourt toute la photothèque une fois par semaine.");
                     }

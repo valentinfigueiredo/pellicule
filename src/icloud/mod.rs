@@ -25,7 +25,15 @@ fn last_full_path(dir: &Path) -> std::path::PathBuf {
     dir.join("derniere-verification-complete.txt")
 }
 
+/// Présent une fois la photothèque parcourue avec les retouches et les vidéos Live.
+const EXTRAS_MARKER: &str = "retouches-et-live.ok";
+
 fn needs_full_check(dir: &Path) -> bool {
+    // Photothèque récupérée par une version précédente : il faut un passage complet
+    // pour aller chercher les retouches et les vidéos Live des anciennes photos.
+    if dir.join("deja-recuperees.txt").exists() && !dir.join(EXTRAS_MARKER).exists() {
+        return true;
+    }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let last = std::fs::read_to_string(last_full_path(dir)).ok().and_then(|s| s.trim().parse::<u64>().ok());
     if last.is_none() && dir.join("deja-recuperees.txt").exists() {
@@ -67,6 +75,7 @@ impl Worker {
         let (st, sp) = (state.clone(), stop.clone());
         let dir = album_root.join(".pellicule").join("icloud");
         let inbox = album_root.join(crate::album::INBOX);
+        let live = album_root.join(crate::album::LIVE);
         std::thread::spawn(move || {
             let set = |s: State| {
                 *st.lock().unwrap() = s;
@@ -132,7 +141,7 @@ impl Worker {
                     Ok(Cmd::Sync { full }) if ready => {
                         sp.store(false, Ordering::Relaxed);
                         set(State::Syncing { seen: 0, total: 0, downloaded: 0, bytes: 0, speed: 0, quick: !full });
-                        let result = sync::run(&mut session, &dir, &inbox, full, &sp, &mut |p| {
+                        let result = sync::run(&mut session, &dir, &inbox, &live, full, &sp, &mut |p| {
                             set(State::Syncing {
                                 seen: p.seen,
                                 total: p.total,
@@ -148,6 +157,7 @@ impl Worker {
                                 if s.complete {
                                     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
                                     let _ = std::fs::write(last_full_path(&dir), now.to_string());
+                                    let _ = std::fs::write(dir.join(EXTRAS_MARKER), "");
                                 }
                                 let mut msg = match s.downloaded {
                                     0 => "Tout est déjà dans ta pellicule.".to_string(),
