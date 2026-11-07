@@ -21,7 +21,11 @@ Pellicule\
 
 ## Utilisation sur Windows
 
-1. Mets `pellicule.exe` où tu veux (par ex. `C:\Outils\Pellicule\`).
+1. Télécharge `pellicule.exe` et double-clique dessus. Pellicule propose de **s'installer** : icône
+   sur le Bureau et dans le menu Démarrer, sans droits administrateur (dans
+   `%LOCALAPPDATA%\Programs\Pellicule`). Pour la retirer : Paramètres > Applications installées >
+   Pellicule > Désinstaller (l'album, les photos et les réglages restent).
+   Les réglages (emplacement de l'album) sont dans `%APPDATA%\Pellicule\pellicule.ini`.
 2. **Premier lancement** : double-clic → il te demande où créer l'album
    (par défaut `C:\Users\<toi>\Pictures\Pellicule`). Le choix est mémorisé dans `pellicule.ini`.
 3. **Rassembler ce que tu as déjà** : glisse tes dossiers (téléphone, clé USB, disque externe,
@@ -90,6 +94,7 @@ pellicule surveiller                      range « À trier » en continu
 pellicule album D:\MonAlbum               change l'emplacement de l'album
 pellicule apercu D:\photo.heic            explique pourquoi un aperçu ne s'affiche pas
 pellicule ranger                          relit les dates et range ce qui n'est pas à sa place
+pellicule installer / desinstaller        installe sur ce PC / désinstalle (l'album reste)
 ```
 
 ## Trier

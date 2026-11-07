@@ -3,7 +3,7 @@
 
 use crate::album::{self, Album, InboxWatcher, Mode, Outcome};
 use crate::place::{self, LatLon};
-use crate::{config, icloud, map, platform, thumbs, update};
+use crate::{config, icloud, install, map, platform, thumbs, update};
 use eframe::egui::{
     self, Align, Align2, Color32, Context, CornerRadius, FontId, Id, LayerId, Layout, Order, Rect,
     Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2,
@@ -32,11 +32,21 @@ pub fn run(album_flag: Option<PathBuf>, paths: Vec<PathBuf>) -> io::Result<()> {
             .with_title("Pellicule")
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([420.0, 320.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native("Pellicule", options, Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, root, paths)))))
         .map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// L'icône de la fenêtre et de la barre des tâches.
+fn window_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../assets/pellicule.png")).map(|i| i.to_rgba8());
+    match img {
+        Ok(i) => egui::IconData { width: i.width(), height: i.height(), rgba: i.into_raw() },
+        Err(_) => egui::IconData::default(),
+    }
 }
 
 // ------------------------------------------------------------------ tâches de fond
@@ -380,6 +390,11 @@ struct App {
     map: map::MapView,
     /// Fenêtre « Infos » ouverte : (chemin relatif, lignes à afficher).
     info: Option<(String, Vec<(String, String)>)>,
+    /// Bandeau « Installer sur ce PC » (Windows, quand Pellicule tourne depuis un autre endroit).
+    install_offer: bool,
+    install_error: Option<String>,
+    /// Case « Installer sur ce PC » de l'écran de bienvenue.
+    setup_install: bool,
     /// Photos localisées (chemin relatif → position).
     places: HashMap<String, LatLon>,
     /// Fichiers dont on a déjà cherché la position (avec ou sans résultat).
@@ -451,6 +466,11 @@ impl App {
             view: if std::env::var_os("PELLICULE_CARTE").is_some() { View::Carte } else { View::Photos },
             map: map::MapView::default(),
             info: None,
+            install_offer: (cfg!(windows) || std::env::var_os("PELLICULE_INSTALL").is_some()) // captures de développement
+                && !install::running_installed()
+                && config::get("proposer_installation").as_deref() != Some("non"),
+            install_error: None,
+            setup_install: cfg!(windows) && !install::running_installed(),
             places: HashMap::new(),
             places_scanned: 0,
             place_tx: None,
@@ -615,14 +635,29 @@ impl App {
                         }
                     }
                 });
-                ui.add_space(18.0);
+                ui.add_space(14.0);
+                if cfg!(windows) && !install::running_installed() {
+                    ui.checkbox(&mut self.setup_install, "Installer Pellicule sur ce PC (icône sur le Bureau et dans le menu Démarrer)");
+                    ui.add_space(10.0);
+                }
                 let create = ui.add(egui::Button::new(egui::RichText::new("Créer mon album").size(17.0)).min_size(vec2(200.0, 38.0)));
                 if create.clicked() && !self.setup_path.trim().is_empty() {
                     let root = config::absolute(Path::new(self.setup_path.trim().trim_matches('"')));
                     if let Err(e) = config::save_album(&root) {
                         self.status = format!("Choix non mémorisé : {e}");
                     }
+                    if self.setup_install {
+                        // L'album est mémorisé : la version installée l'ouvrira directement.
+                        match install::install() {
+                            Ok(exe) => install::relaunch(&exe),
+                            Err(e) => self.install_error = Some(e),
+                        }
+                    }
                     self.start(ui.ctx(), root);
+                }
+                if let Some(e) = &self.install_error {
+                    ui.add_space(8.0);
+                    ui.colored_label(ui.visuals().error_fg_color, format!("Installation impossible : {e}"));
                 }
             });
         });
@@ -688,6 +723,46 @@ impl App {
                 });
             });
             ui.add_space(6.0);
+        });
+    }
+
+    /// Bandeau proposant d'installer Pellicule (icône sur le Bureau), sous Windows.
+    fn install_banner(&mut self, ui: &mut egui::Ui) {
+        if !self.install_offer {
+            return;
+        }
+        let fill = if ui.visuals().dark_mode { Color32::from_rgb(48, 40, 24) } else { Color32::from_rgb(255, 246, 225) };
+        let frame = egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(14, 10));
+        let busy = self.activity.is_some();
+        egui::Panel::top("installation").frame(frame).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let text = if install::is_installed() {
+                    "Pellicule est déjà installée sur ce PC, mais tu utilises une autre copie."
+                } else {
+                    "Installe Pellicule sur ce PC : icône sur le Bureau et dans le menu Démarrer. Ton album ne bouge pas."
+                };
+                ui.label(text);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Ne plus proposer").clicked() {
+                        let _ = config::set("proposer_installation", "non");
+                        self.install_offer = false;
+                    }
+                    if ui.small_button("Plus tard").clicked() {
+                        self.install_offer = false;
+                    }
+                    let label = if install::is_installed() { "Installer cette version" } else { "Installer" };
+                    let button = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(ui.visuals().selection.bg_fill);
+                    if ui.add_enabled(!busy, button).on_disabled_hover_text("Attends la fin de l'import").clicked() {
+                        match install::install() {
+                            Ok(exe) => install::relaunch(&exe),
+                            Err(e) => self.install_error = Some(e),
+                        }
+                    }
+                });
+            });
+            if let Some(e) = &self.install_error {
+                ui.colored_label(ui.visuals().error_fg_color, format!("Installation impossible : {e}"));
+            }
         });
     }
 
@@ -1215,6 +1290,7 @@ impl eframe::App for App {
         }
 
         self.top_bar(ui);
+        self.install_banner(ui);
         self.activity_card(ui);
         self.status_bar(ui);
         let mut wanted = Vec::new();

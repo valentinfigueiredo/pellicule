@@ -25,6 +25,8 @@ UTILISATION
   pellicule album [chemin]                  affiche ou change l'emplacement de l'album
   pellicule apercu <fichier>                explique pourquoi un aperçu ne s'affiche pas
   pellicule ranger                          relit les dates et range ce qui n'est pas à sa place
+  pellicule installer                       installe sur ce PC (icône sur le Bureau)
+  pellicule desinstaller                    désinstalle (l'album et les photos restent)
 
 OPTIONS
   --deplacer        déplace au lieu de copier (les originaux disparaissent)
@@ -37,7 +39,7 @@ RANGEMENT
 ";
 
 pub fn is_command(a: &str) -> bool {
-    matches!(a, "importer" | "surveiller" | "trier" | "ranger" | "album" | "apercu" | "aperçu" | "aide" | "-h" | "--help" | "/?" | "--version")
+    matches!(a, "importer" | "surveiller" | "trier" | "ranger" | "installer" | "desinstaller" | "désinstaller" | "album" | "apercu" | "aperçu" | "aide" | "-h" | "--help" | "/?" | "--version")
 }
 
 pub struct Opts {
@@ -104,6 +106,8 @@ pub fn run(command: &str, opts: Opts, paths: Vec<PathBuf>) -> io::Result<()> {
             sort_inbox(&mut album, &files)
         }
         "surveiller" => watch(&opts),
+        "installer" => crate::install::install_interactive().map_err(io::Error::other),
+        "desinstaller" | "désinstaller" => crate::install::uninstall_interactive().map_err(io::Error::other),
         "ranger" => {
             let mut album = open_album(&opts)?;
             println!("Vérification des dates de {} fichiers…", album.len());
