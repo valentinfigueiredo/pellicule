@@ -30,6 +30,11 @@ Pellicule\
 4. **Au quotidien** : tant que la fenêtre est ouverte, tout ce que tu déposes dans `À trier`
    est renommé, rangé et apparaît dans la pellicule.
 
+Pendant une analyse ou un import, un bandeau sous la barre du haut montre où en est Pellicule :
+dossier en cours d'analyse et nombre de photos trouvées, puis « 2 157 / 10 946 · 2 044 ajoutées ·
+113 déjà présentes », le temps restant estimé, et un bouton « Arrêter ». Si tu glisses un disque entier,
+les dossiers de Windows et des logiciels (Windows, Program Files, AppData…) sont ignorés.
+
 Aperçus : Pellicule décode elle-même, **sans codec à installer**, les JPEG, PNG, WebP, GIF,
 BMP, TIFF, les **HEIC** de l'iPhone, les **RAW** (aperçu JPEG intégré : CR2, CR3, NEF, ARW, DNG,
 RAF, ORF, RW2…) et les **vidéos MP4/MOV** en H.264 ou HEVC (une image prise vers 10 % de la vidéo).

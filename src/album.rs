@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -407,6 +408,12 @@ pub struct Sources {
 }
 
 pub fn gather(album_root: &Path, paths: &[PathBuf]) -> Sources {
+    gather_with(album_root, paths, &AtomicBool::new(false), &mut |_, _| {})
+}
+
+/// Comme `gather`, en signalant chaque dossier parcouru (et le nombre de fichiers trouvés),
+/// et en s'arrêtant si `stop` passe à vrai. Pour un disque entier, ça peut être long.
+pub fn gather_with(album_root: &Path, paths: &[PathBuf], stop: &AtomicBool, progress: &mut dyn FnMut(&Path, usize)) -> Sources {
     let root = fs::canonicalize(album_root).unwrap_or(album_root.to_path_buf());
     let inbox = root.join(INBOX);
     let mut s = Sources::default();
@@ -421,11 +428,50 @@ pub fn gather(album_root: &Path, paths: &[PathBuf]) -> Sources {
             s.inbox.extend(collect(&p));
         } else if canon.starts_with(&root) {
             s.warnings.push(format!("Déjà dans l'album, ignoré : {}", p.display()));
+        } else if p.is_file() {
+            if is_media(&p) {
+                s.outside.push(p);
+            }
         } else {
-            s.outside.extend(collect(&p));
+            let before = s.outside.len();
+            scan(&p, &mut s.outside, before, stop, progress);
         }
     }
     s
+}
+
+/// Parcours d'un dossier déposé : comme `walk`, mais interruptible, avec suivi,
+/// et sans fouiller les dossiers de Windows et des logiciels (leurs icônes ne sont pas des photos).
+fn scan(dir: &Path, out: &mut Vec<PathBuf>, base: usize, stop: &AtomicBool, progress: &mut dyn FnMut(&Path, usize)) {
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    progress(dir, out.len() - base);
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let mut items: Vec<_> = rd.filter_map(Result::ok).collect();
+    items.sort_by_key(|e| e.file_name());
+    for e in items {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(ft) = e.file_type() else { continue };
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if ft.is_dir() {
+            if !skip_dir(&name) && !is_system_dir(&name) {
+                scan(&e.path(), out, base, stop, progress);
+            }
+        } else if ft.is_file() && !name.starts_with('.') && is_media(&e.path()) {
+            out.push(e.path());
+        }
+    }
+}
+
+fn is_system_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "windows" | "program files" | "program files (x86)" | "programdata" | "appdata" | "recovery" | "perflogs" | "node_modules"
+    )
 }
 
 /// Tous les fichiers photo/vidéo d'un chemin (fichier ou dossier), triés.

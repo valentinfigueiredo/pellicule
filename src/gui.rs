@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MONTHS: [&str; 12] = [
     "janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
@@ -48,12 +50,61 @@ enum Cmd {
 enum Ev {
     Loaded(Vec<String>),
     Added(String),
-    Progress(usize, usize),
+    /// Une commande commence (pour le compteur des dépôts en attente).
+    Started,
+    Activity(Activity),
     Done(String),
     Status(String),
 }
 
-fn jobs(root: PathBuf, cmds: Receiver<Cmd>, events: Sender<Ev>, ctx: Context) {
+/// Ce que Pellicule est en train de faire, affiché dans le bandeau sous la barre du haut.
+#[derive(Clone)]
+struct Activity {
+    title: String,
+    /// Dossier ou fichier en cours.
+    detail: String,
+    done: usize,
+    /// `None` pendant l'analyse d'un dossier : on ne sait pas encore combien il y en a.
+    total: Option<usize>,
+    added: usize,
+    dups: usize,
+    errors: usize,
+    elapsed: Duration,
+    /// Le bouton « Arrêter » a un effet.
+    cancellable: bool,
+}
+
+impl Activity {
+    fn new(title: impl Into<String>, total: Option<usize>, started: Instant) -> Activity {
+        Activity {
+            title: title.into(),
+            detail: String::new(),
+            done: 0,
+            total,
+            added: 0,
+            dups: 0,
+            errors: 0,
+            elapsed: started.elapsed(),
+            cancellable: true,
+        }
+    }
+}
+
+/// Envoie l'état au plus 10 fois par seconde : un disque entier, c'est des centaines de milliers de fichiers.
+struct Throttle(Instant);
+
+impl Throttle {
+    fn ready(&mut self) -> bool {
+        if self.0.elapsed() >= Duration::from_millis(100) {
+            self.0 = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn jobs(root: PathBuf, cmds: Receiver<Cmd>, events: Sender<Ev>, ctx: Context, stop: Arc<AtomicBool>) {
     let send = |e: Ev| {
         let _ = events.send(e);
         ctx.request_repaint();
@@ -68,26 +119,56 @@ fn jobs(root: PathBuf, cmds: Receiver<Cmd>, events: Sender<Ev>, ctx: Context) {
     loop {
         match cmds.recv_timeout(Duration::from_secs(2)) {
             Ok(Cmd::Import(paths)) => {
-                send(Ev::Status("Recherche des photos et vidéos…".into()));
-                let sources = album::gather(&album.root, &paths);
+                send(Ev::Started);
+                stop.store(false, Ordering::Relaxed);
+                let started = Instant::now();
+                let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                let title = match names.as_slice() {
+                    [one] => format!("Analyse de « {one} »"),
+                    many => format!("Analyse de {} dossiers et fichiers", many.len()),
+                };
+                let mut act = Activity::new(title, None, started);
+                send(Ev::Activity(act.clone()));
+                let mut throttle = Throttle(Instant::now());
+                let sources = album::gather_with(&album.root, &paths, &stop, &mut |dir, found| {
+                    if throttle.ready() {
+                        act.detail = dir.display().to_string();
+                        act.done = found;
+                        act.elapsed = started.elapsed();
+                        send(Ev::Activity(act.clone()));
+                    }
+                });
+                if stop.load(Ordering::Relaxed) {
+                    send(Ev::Done("Arrêté pendant l'analyse : rien n'a été ajouté.".into()));
+                    continue;
+                }
                 if let Some(w) = sources.warnings.into_iter().last() {
                     send(Ev::Status(w));
                 }
+                let mut msg = String::new();
                 if !sources.inbox.is_empty() {
-                    batch(&mut album, &sources.inbox, Mode::Move, &send);
+                    msg = batch(&mut album, &sources.inbox, Mode::Move, "Rangement de « À trier »".into(), &send, &stop);
                     album::prune_empty_dirs(&album.inbox());
                 }
-                if sources.outside.is_empty() {
-                    send(Ev::Done("Aucune nouvelle photo ni vidéo trouvée.".into()));
-                } else {
-                    batch(&mut album, &sources.outside, Mode::Copy, &send);
+                if !sources.outside.is_empty() && !stop.load(Ordering::Relaxed) {
+                    let n = sources.outside.len();
+                    let title = format!("Import de {} photo{} et vidéo{}", spaced(n), plural(n), plural(n));
+                    msg = batch(&mut album, &sources.outside, Mode::Copy, title, &send, &stop);
                 }
+                send(Ev::Done(if msg.is_empty() { "Aucune photo ni vidéo trouvée.".into() } else { msg }));
             }
             Ok(Cmd::Reorganize) => {
-                send(Ev::Status("Vérification des dates…".into()));
+                send(Ev::Started);
+                let started = Instant::now();
+                let mut act = Activity::new("Vérification des dates", Some(album.len()), started);
+                act.cancellable = false;
+                let mut throttle = Throttle(Instant::now());
                 match album.reorganize(&mut |done, total| {
-                    if done % 20 == 0 || done == total {
-                        send(Ev::Progress(done.min(total.saturating_sub(1)), total));
+                    if throttle.ready() {
+                        act.done = done;
+                        act.total = Some(total);
+                        act.elapsed = started.elapsed();
+                        send(Ev::Activity(act.clone()));
                     }
                 }) {
                     Ok(moved) => {
@@ -104,9 +185,11 @@ fn jobs(root: PathBuf, cmds: Receiver<Cmd>, events: Sender<Ev>, ctx: Context) {
             Err(RecvTimeoutError::Timeout) => {
                 let ready = watcher.poll(&album.inbox());
                 if !ready.is_empty() {
-                    batch(&mut album, &ready, Mode::Move, &send);
+                    stop.store(false, Ordering::Relaxed);
+                    let msg = batch(&mut album, &ready, Mode::Move, "Rangement de « À trier »".into(), &send, &stop);
                     album::prune_empty_dirs(&album.inbox());
                     watcher.done(ready);
+                    send(Ev::Done(msg));
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -114,35 +197,52 @@ fn jobs(root: PathBuf, cmds: Receiver<Cmd>, events: Sender<Ev>, ctx: Context) {
     }
 }
 
-fn batch(album: &mut Album, files: &[PathBuf], mode: Mode, send: &dyn Fn(Ev)) {
-    let (mut added, mut dups, mut errors) = (0, 0, 0);
+/// Importe une liste de fichiers en tenant le bandeau à jour. Renvoie le résumé à afficher.
+fn batch(album: &mut Album, files: &[PathBuf], mode: Mode, title: String, send: &dyn Fn(Ev), stop: &AtomicBool) -> String {
+    let started = Instant::now();
+    let mut act = Activity::new(title, Some(files.len()), started);
+    let mut throttle = Throttle(Instant::now());
+    let mut stopped = false;
     for (i, f) in files.iter().enumerate() {
-        send(Ev::Progress(i, files.len()));
+        if stop.load(Ordering::Relaxed) {
+            stopped = true;
+            break;
+        }
         match album.import(f, mode) {
             Ok(Outcome::Added { rel, .. }) => {
-                added += 1;
+                act.added += 1;
                 send(Ev::Added(rel));
             }
-            Ok(Outcome::Duplicate { .. }) => dups += 1,
+            Ok(Outcome::Duplicate { .. }) => act.dups += 1,
             Ok(Outcome::Ignored) => {}
-            Err(_) => errors += 1,
+            Err(_) => act.errors += 1,
+        }
+        act.done = i + 1;
+        if throttle.ready() || i + 1 == files.len() {
+            act.detail = f.display().to_string();
+            act.elapsed = started.elapsed();
+            send(Ev::Activity(act.clone()));
         }
         if i % 500 == 499 {
             let _ = album.save();
         }
     }
     let save = album.save();
-    let mut msg = format!("{added} ajoutée{} à ta pellicule", if added > 1 { "s" } else { "" });
+    let (added, dups, errors) = (act.added, act.dups, act.errors);
+    let mut msg = format!("{} ajoutée{} à ta pellicule", spaced(added), plural(added));
     if dups > 0 {
-        msg += &format!(", {dups} déjà présente{}", if dups > 1 { "s" } else { "" });
+        msg += &format!(", {} déjà présente{}", spaced(dups), plural(dups));
     }
     if errors > 0 {
-        msg += &format!(", {errors} erreur{}", if errors > 1 { "s" } else { "" });
+        msg += &format!(", {} erreur{}", spaced(errors), plural(errors));
     }
     if let Err(e) = save {
         msg += &format!(" (index non enregistré : {e})");
     }
-    send(Ev::Done(msg + "."));
+    if stopped {
+        msg = format!("Arrêté : {msg}");
+    }
+    msg + "."
 }
 
 // ------------------------------------------------------------------ modèle
@@ -255,10 +355,17 @@ struct App {
     thumbs: HashMap<String, Thumb>,
     loader: thumbs::Loader,
     size: f32,
-    progress: Option<(usize, usize)>,
+    /// Ce qui tourne en arrière-plan (analyse, import, rangement).
+    activity: Option<Activity>,
+    /// Le dernier résumé, affiché quelques secondes dans le bandeau.
+    finished: Option<(String, Instant)>,
+    stop: Arc<AtomicBool>,
+    /// Dépôts envoyés mais pas encore commencés.
+    queued: usize,
     status: String,
     capture: Option<PathBuf>,
     quiet_frames: u32,
+    born: Instant,
     thumb_failures: usize,
     update: update::State,
     updates: Option<Receiver<update::State>>,
@@ -324,10 +431,14 @@ impl App {
             thumbs: HashMap::new(),
             loader: thumbs::Loader::new(ctx.clone()),
             size: 160.0,
-            progress: None,
+            activity: None,
+            finished: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            queued: 0,
             status: String::new(),
             capture: std::env::var_os("PELLICULE_CAPTURE").map(PathBuf::from),
             quiet_frames: 0,
+            born: Instant::now(),
             thumb_failures: 0,
             update: update::State::Unknown,
             updates: Some(update::check_in_background(ctx.clone())),
@@ -354,10 +465,10 @@ impl App {
     fn start(&mut self, ctx: &Context, root: PathBuf) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (ev_tx, ev_rx) = mpsc::channel();
-        let (r, c) = (root.clone(), ctx.clone());
-        std::thread::spawn(move || jobs(r, cmd_rx, ev_tx, c));
-        if !self.pending.is_empty() {
-            let _ = cmd_tx.send(Cmd::Import(std::mem::take(&mut self.pending)));
+        let (r, c, st) = (root.clone(), ctx.clone(), self.stop.clone());
+        std::thread::spawn(move || jobs(r, cmd_rx, ev_tx, c, st));
+        if !self.pending.is_empty() && cmd_tx.send(Cmd::Import(std::mem::take(&mut self.pending))).is_ok() {
+            self.queued += 1;
         }
         self.icloud = Some(icloud::Worker::start(&root, ctx.clone()));
         self.loader.set_cache(root.join(".pellicule").join("miniatures"));
@@ -375,7 +486,9 @@ impl App {
 
     fn import(&mut self, paths: Vec<PathBuf>) {
         if let Some(cmds) = &self.cmds {
-            let _ = cmds.send(Cmd::Import(paths));
+            if cmds.send(Cmd::Import(paths)).is_ok() {
+                self.queued += 1;
+            }
         }
     }
 
@@ -398,9 +511,11 @@ impl App {
                     self.items.push(Item::new(&root, rel));
                     changed = true;
                 }
-                Ev::Progress(done, total) => self.progress = Some((done, total)),
+                Ev::Started => self.queued = self.queued.saturating_sub(1),
+                Ev::Activity(a) => self.activity = Some(a),
                 Ev::Done(msg) => {
-                    self.progress = None;
+                    self.activity = None;
+                    self.finished = Some((msg.clone(), Instant::now()));
                     self.status = msg;
                 }
                 Ev::Status(msg) => self.status = msg,
@@ -460,7 +575,7 @@ impl App {
                 }
             }
         }
-        if self.progress.is_none() {
+        if self.activity.is_none() {
             self.status = format!(
                 "{} aperçu{} impossible{} (détails dans .pellicule{}apercus.log)",
                 self.thumb_failures,
@@ -540,11 +655,13 @@ impl App {
                         }
                     }
                     let sort = ui
-                        .add_enabled(self.progress.is_none(), egui::Button::new("Trier"))
+                        .add_enabled(self.activity.is_none(), egui::Button::new("Trier"))
                         .on_hover_text("Relit la date de chaque photo et range celles qui ne sont pas à leur place");
                     if sort.clicked() {
                         if let Some(cmds) = &self.cmds {
-                            let _ = cmds.send(Cmd::Reorganize);
+                            if cmds.send(Cmd::Reorganize).is_ok() {
+                                self.queued += 1;
+                            }
                         }
                     }
                     if ui.button("+  Ajouter des photos…").clicked() {
@@ -570,12 +687,91 @@ impl App {
                     ui.weak("Taille");
                 });
             });
-            if let Some((done, total)) = self.progress {
-                ui.add_space(4.0);
-                ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).text(format!("{} / {}", done + 1, total)));
-            }
             ui.add_space(6.0);
         });
+    }
+
+    /// Le bandeau d'activité : ce qui est analysé ou importé en ce moment, et où on en est.
+    fn activity_card(&mut self, ui: &mut egui::Ui) {
+        if self.finished.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(10)) {
+            self.finished = None;
+        }
+        if self.activity.is_none() && self.finished.is_none() && self.queued == 0 {
+            return;
+        }
+        let accent = ui.visuals().selection.bg_fill;
+        let fill = if ui.visuals().dark_mode { Color32::from_rgb(30, 38, 48) } else { Color32::from_rgb(234, 243, 253) };
+        let frame = egui::Frame::new()
+            .fill(fill)
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .stroke(Stroke::new(1.0, accent.gamma_multiply(0.5)));
+        let mut stop_clicked = false;
+        let mut close = false;
+        egui::Panel::top("activite").frame(frame).show(ui, |ui| {
+            match &self.activity {
+                Some(a) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(&a.title).strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if a.cancellable && ui.button("Arrêter").clicked() {
+                                stop_clicked = true;
+                            }
+                            ui.weak(duration_label(a.elapsed));
+                        });
+                    });
+                    let mut line = match a.total {
+                        None => format!("{} photo{} et vidéo{} trouvée{} pour l'instant", spaced(a.done), plural(a.done), plural(a.done), plural(a.done)),
+                        Some(total) => format!("{} / {}", spaced(a.done), spaced(total)),
+                    };
+                    if a.added + a.dups + a.errors > 0 {
+                        line += &format!(" · {} ajoutée{}", spaced(a.added), plural(a.added));
+                        if a.dups > 0 {
+                            line += &format!(" · {} déjà présente{}", spaced(a.dups), plural(a.dups));
+                        }
+                        if a.errors > 0 {
+                            line += &format!(" · {} erreur{}", spaced(a.errors), plural(a.errors));
+                        }
+                    }
+                    if let Some(total) = a.total.filter(|&t| a.done > 0 && a.done < t && a.elapsed > Duration::from_secs(5)) {
+                        let left = a.elapsed.mul_f64((total - a.done) as f64 / a.done as f64);
+                        line += &format!(" · encore environ {}", duration_label(left));
+                    }
+                    ui.label(line);
+                    if let Some(total) = a.total {
+                        ui.add(egui::ProgressBar::new(a.done as f32 / total.max(1) as f32).desired_height(6.0));
+                    }
+                    if !a.detail.is_empty() {
+                        ui.add(egui::Label::new(egui::RichText::new(&a.detail).weak().small()).truncate());
+                    }
+                }
+                None => {
+                    if let Some((msg, _)) = &self.finished {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("Terminé : {msg}")).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Fermer").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
+                }
+            }
+            if self.queued > 0 {
+                ui.weak(format!("{} autre{} dépôt{} en attente", self.queued, plural(self.queued), plural(self.queued)));
+            }
+        });
+        if stop_clicked {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        if close {
+            self.finished = None;
+        }
+        if self.activity.is_some() || self.finished.is_some() {
+            // Pour le compteur de temps et pour faire disparaître le résumé.
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
     }
 
     fn icloud_window(&mut self, ctx: &Context) {
@@ -769,7 +965,7 @@ impl App {
                 let label = egui::RichText::new(format!("Mettre à jour (v{version})")).color(Color32::WHITE);
                 let button = egui::Button::new(label).fill(ui.visuals().selection.bg_fill);
                 // Pas pendant un import : on ne coupe pas l'appli au milieu d'une copie.
-                let resp = ui.add_enabled(self.progress.is_none(), button).on_hover_text("Télécharge la dernière version sur GitHub et relance Pellicule");
+                let resp = ui.add_enabled(self.activity.is_none(), button).on_hover_text("Télécharge la dernière version sur GitHub et relance Pellicule");
                 if resp.clicked() {
                     if cfg!(windows) {
                         self.updates = Some(update::install_in_background(ui.ctx().clone(), rev.clone()));
@@ -972,6 +1168,16 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// 12345 → « 12 345 ».
+/// 75 s → « 1 min 15 s ».
+fn duration_label(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..=59 => format!("{s} s"),
+        60..=3599 => format!("{} min {:02} s", s / 60, s % 60),
+        _ => format!("{} h {:02} min", s / 3600, (s % 3600) / 60),
+    }
+}
+
 pub(crate) fn spaced(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
@@ -1009,6 +1215,7 @@ impl eframe::App for App {
         }
 
         self.top_bar(ui);
+        self.activity_card(ui);
         self.status_bar(ui);
         let mut wanted = Vec::new();
         if self.view == View::Carte {
@@ -1053,7 +1260,13 @@ impl App {
         let Some(path) = self.capture.clone() else { return };
         self.quiet_frames += 1;
         ctx.request_repaint_after(Duration::from_millis(50));
-        if (self.loaded || self.root.is_none()) && self.progress.is_none() && self.quiet_frames == 40 {
+        let after = std::env::var("PELLICULE_CAPTURE_APRES").ok().and_then(|v| v.parse::<u64>().ok());
+        let due = match after {
+            Some(secs) => self.born.elapsed() >= Duration::from_secs(secs) && self.quiet_frames < 1_000_000,
+            None => (self.loaded || self.root.is_none()) && self.activity.is_none() && self.quiet_frames == 40,
+        };
+        if due {
+            self.quiet_frames = 2_000_000;
             ctx.request_screenshot(move |img| {
                 save_capture(&path, &img);
                 std::process::exit(0);
